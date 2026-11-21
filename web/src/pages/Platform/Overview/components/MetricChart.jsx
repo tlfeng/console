@@ -40,7 +40,8 @@ export default (props) => {
       customRenderChart,
       instance,
       pointerUpdate,
-      handleTimeIntervalChange
+      handleTimeIntervalChange,
+      advancedTopN
     } = props;
   
     const [loading, setLoading] = useState(false)
@@ -69,6 +70,7 @@ export default (props) => {
         key: metricKey,
         timeout
       }
+      if (advancedTopN) newQueryParams.advanced_topn = true
       if (timeInterval) {
         newQueryParams.bucket_size = timeInterval
       }
@@ -77,7 +79,17 @@ export default (props) => {
         queryParams: newQueryParams,
         ignoreTimeout: true
       }, false, false)
-      if (res?.error) {
+      if (res?.topn_status) {
+        const messages = {
+          unsupported: 'Automatic TopN is unavailable. Select an index or node to view its metrics.',
+          history_unavailable: 'Original monitoring data is not available for this entire window. Select a more recent window or choose an index or node.',
+          invalid_request: 'Invalid TopN time range or chart settings.',
+          budget_exceeded: 'Automatic TopN exceeded its query limit. Try a shorter window, a coarser interval, or select an index or node.',
+          query_failed: 'Automatic TopN could not be calculated. Try again or select an index or node.'
+        };
+        setMetric(undefined);
+        setError(res.topn_status === 'no_data' ? undefined : (messages[res.topn_status] || messages.query_failed));
+      } else if (res?.error) {
         const error = formatResponse(res);
         setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
       } else if (res && !res.error) {

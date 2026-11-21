@@ -145,7 +145,8 @@ export default (props) => {
                     <div className="metric-inner-cnt">
                       {
                         item[1].map((metricKey) => (
-                          <MetricChart 
+                          <MetricChart
+                            advancedTopN={props.advancedTopN}
                             key={metricKey} 
                             instance={charts[metricKey]} 
                             pointerUpdate={pointerUpdate}

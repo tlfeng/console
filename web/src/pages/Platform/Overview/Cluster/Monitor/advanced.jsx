@@ -110,6 +110,7 @@ export default (props) => {
         })}
       >
         <NodeMetric
+          advancedTopN
           {...props}
           param={param}
           setParam={setParam}
@@ -252,6 +253,7 @@ export default (props) => {
         })}
       >
         <IndexMetric
+          advancedTopN
           {...props}
           param={param}
           setParam={setParam}

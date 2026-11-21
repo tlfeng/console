@@ -27,6 +27,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"infini.sh/console/modules/elastic/api/topn"
 	"math"
 	"net/http"
 	"strconv"
@@ -723,6 +724,30 @@ func (h *APIHandler) HandleClusterMetricsAction(w http.ResponseWriter, req *http
 func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	resBody := map[string]interface{}{}
 	id := ps.ByName("id")
+	if cfg, enrolled := topn.Policy(req, id); enrolled && GetMonitorState(id) == elastic.ModeAgentless && h.Get(req, "node_name", "") == "" {
+		key := h.GetParameter(req, "key")
+		switch key {
+		case NodeProcessCPUMetricKey, NodeOSCPUMetricKey, JVMHeapUsedPercentMetricKey, IndexStorageMetricKey:
+		default:
+			topn.Status(w, topn.Unsupported)
+			return
+		}
+		if topn.Disabled(cfg, "node_stats", key) {
+			topn.Status(w, topn.Unsupported)
+			return
+		}
+		width, _, _, err := h.GetMetricRangeAndBucketSize(req, id, v1.MetricTypeNodeStats, 90)
+		min, max, n, valid := topn.Window(req, width)
+		if err != nil || !valid {
+			topn.Status(w, topn.InvalidRequest)
+			return
+		}
+		def := nodeMetricItemsForKey(key)[0]
+		q := topn.Query{Cluster: id, Source: "node_stats", Min: min, Max: max, Width: width, N: n}
+		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Format: def.FormatType, Units: def.Units})
+		return
+	}
+
 	bucketSize, min, max, err := h.GetMetricRangeAndBucketSize(req, id, v1.MetricTypeNodeStats, 90)
 	if err != nil {
 		log.Error(err)
