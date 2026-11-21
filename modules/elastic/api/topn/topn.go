@@ -14,60 +14,24 @@ import (
 	log "github.com/cihub/seelog"
 	"infini.sh/framework/core/elastic"
 	"infini.sh/framework/core/env"
+	"infini.sh/framework/core/event"
 	"infini.sh/framework/core/global"
+	"infini.sh/framework/core/orm"
+	"infini.sh/framework/core/radix"
 	"infini.sh/framework/core/util"
 	"infini.sh/framework/modules/elastic/common"
 )
 
-const (
-	Unsupported        = "unsupported"
-	HistoryUnavailable = "history_unavailable"
-	InvalidRequest     = "invalid_request"
-	BudgetExceeded     = "budget_exceeded"
-	QueryFailed        = "query_failed"
-	NoData             = "no_data"
+var (
+	errBudget     = errors.New("automatic TopN budget exceeded")
+	errRawHistory = errors.New("automatic TopN raw history unavailable")
 )
-
-var errBudget = errors.New("automatic TopN budget exceeded")
 
 type config struct {
 	TopN struct {
-		Clusters     []string `config:"clusters"`
-		DisabledKeys []string `config:"disabled_keys"`
-		RawIndex     string   `config:"raw_index"`
-		RawFrom      string   `config:"raw_from"`
+		RawIndex string `config:"raw_index"`
+		RawFrom  string `config:"raw_from"`
 	} `config:"topn"`
-}
-
-// Policy leaves non-enrolled clusters and callers outside Advanced unchanged.
-func Policy(req *http.Request, cluster string) (config, bool) {
-	var cfg config
-	if req.URL.Query().Get("advanced_topn") != "true" {
-		return cfg, false
-	}
-	if _, err := env.ParseConfig("insight", &cfg); err != nil {
-		return cfg, false
-	}
-	for _, id := range cfg.TopN.Clusters {
-		if cluster == id {
-			return cfg, true
-		}
-	}
-	return cfg, false
-}
-
-func Status(w http.ResponseWriter, status string) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"topn_status": status})
-}
-
-func Disabled(cfg config, source, key string) bool {
-	for _, disabled := range cfg.TopN.DisabledKeys {
-		if disabled == source+":"+key {
-			return true
-		}
-	}
-	return false
 }
 
 // Window preserves the exact client bounds rather than the legacy seconds conversion.
@@ -108,12 +72,6 @@ func parseTime(raw string) (int64, error) {
 	return t.UnixMilli(), nil
 }
 
-type Metric struct {
-	Item                         *common.MetricItem
-	Field, Field2, Units, Format string
-	Counter                      bool
-}
-
 type Query struct {
 	Cluster, Source string
 	Min, Max        int64
@@ -152,6 +110,15 @@ func (q Query) filter() (dsl, bool) {
 	return pred, true
 }
 
+// The engine's wildcard filter is a candidate filter. Verify returned keys
+// with the same matcher used by Console's existing index authorization.
+func (q Query) authorizer() func(string) bool {
+	if q.Source != "index_stats" || q.AllIndices {
+		return func(string) bool { return true }
+	}
+	return radix.Compile(q.Indices...).Match
+}
+
 func (q Query) entity() string {
 	if q.Source == "index_stats" {
 		return "metadata.labels.index_name"
@@ -178,22 +145,22 @@ type requester interface {
 
 type caller func(context.Context, string, string, dsl) ([]byte, error)
 
-func monitoredStore() (caller, bool) {
+func monitoredStore() (caller, elastic.Version) {
 	id, _ := global.Lookup(elastic.GlobalSystemElasticsearchID).(string)
 	if id == "" {
-		return nil, false
+		return nil, elastic.Version{}
 	}
 	client := elastic.GetClientNoPanic(id)
-	if client == nil || client.GetVersion().Distribution != elastic.Easysearch {
-		return nil, false
+	if client == nil {
+		return nil, elastic.Version{}
 	}
 	transport, ok := client.(requester)
 	if !ok {
-		return nil, false
+		return nil, elastic.Version{}
 	}
 	base := strings.TrimRight(transport.GetEndpoint(), "/")
 	if base == "" {
-		return nil, false
+		return nil, elastic.Version{}
 	}
 	return func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
 		var wire []byte
@@ -218,7 +185,7 @@ func monitoredStore() (caller, bool) {
 			return nil, fmt.Errorf("monitoring store returned HTTP %d", res.StatusCode)
 		}
 		return res.Body, nil
-	}, true
+	}, client.GetVersion()
 }
 
 type shardCounts struct {
@@ -231,25 +198,55 @@ func (s shardCounts) complete() bool {
 	return s.Total > 0 && s.Successful == s.Total && s.Failed != nil && *s.Failed == 0
 }
 
+type pitAPI struct {
+	path, strictParam, idField string
+}
+
+func pitFor(version elastic.Version) pitAPI {
+	supports := func(floor string) bool {
+		cmp, err := util.VersionCompare(version.Number, floor)
+		return err == nil && cmp >= 0
+	}
+	switch version.Distribution {
+	case elastic.Easysearch:
+		return pitAPI{"/_pit", "allow_partial_pit_creation", "pit_id"}
+	case elastic.Opensearch:
+		if supports("2.4.0") {
+			return pitAPI{"/_search/point_in_time", "allow_partial_pit_creation", "pit_id"}
+		}
+	case elastic.Elasticsearch, "":
+		if supports("8.16.0") {
+			return pitAPI{"/_pit", "allow_partial_search_results", "id"}
+		}
+	}
+	return pitAPI{}
+}
+
 type snapshot struct {
 	call   caller
+	api    pitAPI
 	id     string
 	shards int
 	bytes  int
 }
 
-func open(ctx context.Context, call caller, index string) (*snapshot, error) {
-	const path = "/_pit?keep_alive=30s&allow_partial_pit_creation=false&allow_no_indices=false&ignore_unavailable=false&expand_wildcards=open,hidden"
-	raw, err := call(ctx, http.MethodPost, "/"+index+path, nil)
+func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot, error) {
+	path := "/" + index + api.path + "?keep_alive=30s&" + api.strictParam + "=false&allow_no_indices=false&ignore_unavailable=false&expand_wildcards=open,hidden"
+	raw, err := call(ctx, http.MethodPost, path, nil)
 	if err != nil {
 		return nil, err
 	}
 	var response struct {
-		ID     string      `json:"pit_id"`
+		ID     string      `json:"id"`
+		PITID  string      `json:"pit_id"`
 		Shards shardCounts `json:"_shards"`
 	}
 	err = json.Unmarshal(raw, &response)
-	s := &snapshot{call: call, id: response.ID, shards: response.Shards.Total}
+	id := response.PITID
+	if api.idField == "id" {
+		id = response.ID
+	}
+	s := &snapshot{call: call, api: api, id: id, shards: response.Shards.Total}
 	if err != nil || s.id == "" || !response.Shards.complete() {
 		if s.id != "" {
 			s.close()
@@ -266,16 +263,13 @@ func open(ctx context.Context, call caller, index string) (*snapshot, error) {
 func (s *snapshot) close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := s.call(ctx, http.MethodDelete, "/_pit", dsl{"pit_id": []string{s.id}}); err != nil {
+	body := dsl{"pit_id": []string{s.id}}
+	if s.api.idField == "id" {
+		body = dsl{"id": s.id}
+	}
+	if _, err := s.call(ctx, http.MethodDelete, s.api.path, body); err != nil {
 		log.Warnf("close monitoring TopN snapshot: %v", err)
 	}
-}
-
-type point struct {
-	Time  int64 `json:"key"`
-	Value *struct {
-		Value *float64 `json:"value"`
-	} `json:"value"`
 }
 
 type bucket struct {
@@ -284,8 +278,21 @@ type bucket struct {
 		Value *float64 `json:"value"`
 	} `json:"peak"`
 	Dates *struct {
-		Buckets []point `json:"buckets"`
+		Buckets []samples `json:"buckets"`
 	} `json:"dates"`
+}
+
+type searchResponse struct {
+	Origin     string                     `json:"origin"`
+	ID         string                     `json:"pit_id"`
+	Shards     shardCounts                `json:"_shards"`
+	TimedOut   *bool                      `json:"timed_out"`
+	Terminated bool                       `json:"terminated_early"`
+	Aggs       map[string]json.RawMessage `json:"aggregations"`
+}
+
+func (r searchResponse) complete() bool {
+	return r.Shards.complete() && r.TimedOut != nil && !*r.TimedOut && !r.Terminated
 }
 
 func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
@@ -294,15 +301,10 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if err != nil {
 		return err
 	}
-	var response struct {
-		ID         string      `json:"pit_id"`
-		Shards     shardCounts `json:"_shards"`
-		TimedOut   *bool       `json:"timed_out"`
-		Terminated bool        `json:"terminated_early"`
-		Aggs       struct {
-			Entities json.RawMessage `json:"entities"`
-		} `json:"aggregations"`
+	if len(raw) > (16<<20)-s.bytes {
+		return errBudget
 	}
+	var response searchResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return err
 	}
@@ -310,19 +312,16 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 		s.id = response.ID
 	}
 	s.bytes += len(raw)
-	if s.bytes > 16<<20 {
-		return errBudget
-	}
-	if !response.Shards.complete() || response.Shards.Total != s.shards || response.TimedOut == nil || *response.TimedOut || response.Terminated {
+	if !response.complete() || response.Shards.Total != s.shards {
 		return errors.New("incomplete monitoring search")
 	}
-	return json.Unmarshal(response.Aggs.Entities, result)
+	return json.Unmarshal(response.Aggs["entities"], result)
 }
 
 func terms(field string, n int) dsl { return dsl{"field": field, "size": n, "shard_size": n} }
 
 func display(q Query, metric Metric, name string, data [][]interface{}) {
-	line := metric.Item.AddLine(metric.Item.Key, name, "", "group1", metric.Field, "max", fmt.Sprintf("%ds", q.Width), metric.Units, metric.Format, "0.[00]", "0.[00]", false, metric.Counter)
+	line := metric.Item.AddLine(metric.Item.Key, name, "", "group1", metric.Field, "max", fmt.Sprintf("%ds", q.Width), metric.Units, metric.Format, "0.[00]", "0.[00]", false, metric.mode.difference())
 	line.TimeRange = common.TimeRange{Min: q.Min, Max: q.Max}
 	line.Data = data
 }
@@ -346,7 +345,11 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	}
 	names := make([]string, 0, len(rank.Buckets))
 	scores := make(map[string]float64, len(rank.Buckets))
+	allowed := q.authorizer()
 	for _, b := range rank.Buckets {
+		if !allowed(b.Key) {
+			return errors.New("unexpected entity in TopN authorization filter")
+		}
 		if _, exists := scores[b.Key]; exists || b.Key == "" || b.Peak == nil || b.Peak.Value == nil {
 			return errors.New("invalid TopN ranking")
 		}
@@ -369,22 +372,14 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 		if !ok || data[b.Key] != nil || b.Dates == nil || len(b.Dates.Buckets) == 0 {
 			return errors.New("invalid TopN curve")
 		}
-		points := make([][]interface{}, 0, len(b.Dates.Buckets))
-		peak := -1.0
-		for _, p := range b.Dates.Buckets {
-			if p.Value == nil || p.Value.Value == nil {
-				return errors.New("missing peak sample")
-			}
-			v := *p.Value.Value
-			points = append(points, []interface{}{p.Time, v})
-			if v > peak {
-				peak = v
-			}
+		row, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
+		if err != nil {
+			return err
 		}
-		if peak != score {
+		if row.score != score {
 			return errors.New("ranking does not match curve")
 		}
-		data[b.Key] = points
+		data[b.Key] = row.points
 	}
 	for _, name := range names {
 		display(q, metric, name, data[name])
@@ -392,65 +387,146 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
+// retainedAt checks for original samples at or before the scan boundary on
+// the same snapshot. This is a history guard, not a guarantee of collection
+// completeness or of retention for every entity.
+func (s *snapshot) retainedAt(ctx context.Context, pred dsl, min int64) (bool, error) {
+	coverage := dsl{
+		"filter": filterRange(0, min),
+	}
+	var result struct {
+		Count *int64 `json:"doc_count"`
+	}
+	if err := s.search(ctx, pred, coverage, &result); err != nil {
+		return false, err
+	}
+	if result.Count == nil {
+		return false, errors.New("missing raw sample coverage result")
+	}
+	return *result.Count > 0, nil
+}
+
 var slots = make(chan struct{}, 4)
 
-func Run(w http.ResponseWriter, r *http.Request, cfg config, q Query, metric Metric) {
+var errUnavailable = errors.New("automatic TopN unavailable")
+
+// Serve owns the response for supported Advanced automatic charts. A failed
+// calculation must not be presented as a successful legacy activity ranking.
+func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
+	err := calculate(r.Context(), q, metric)
+	if r.Context().Err() != nil {
+		return
+	}
+	if err == nil {
+		writeMetrics(w, metric)
+		return
+	}
+	status := failureStatus(err)
+	if status == "query_failed" {
+		log.Warnf("automatic monitoring TopN: %v", err)
+	}
+	WriteStatus(w, status)
+}
+
+func failureStatus(err error) string {
+	switch {
+	case errors.Is(err, errRawHistory):
+		return "history_unavailable"
+	case errors.Is(err, errBudget):
+		return "budget_exceeded"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed_out"
+	case errors.Is(err, errUnavailable):
+		return "unavailable"
+	default:
+		return "query_failed"
+	}
+}
+
+func WriteStatus(w http.ResponseWriter, status string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"topn_status": status})
+}
+
+func calculate(ctx context.Context, q Query, metric Metric) error {
+	var cfg config
+	if _, err := env.ParseConfig("insight", &cfg); err != nil {
+		return errUnavailable
+	}
 	pred, ok := q.filter()
 	if !ok {
-		Status(w, Unsupported)
-		return
+		return errUnavailable
 	}
 	min := q.Min
-	if metric.Counter && q.previousBucket() >= 0 {
+	if metric.mode.difference() && q.previousBucket() >= 0 {
 		min = q.previousBucket()
 	}
-	from, err := parseTime(cfg.TopN.RawFrom)
-	if err != nil || from < 0 || min < from || !rawName.MatchString(cfg.TopN.RawIndex) || cfg.TopN.RawIndex == "_all" {
-		Status(w, HistoryUnavailable)
-		return
+	index := cfg.TopN.RawIndex
+	if index == "" {
+		// Use the original write alias, not the legacy search wildcard that
+		// can also match summary indices.
+		index = orm.GetIndexName(event.Event{})
+	}
+	if !rawName.MatchString(index) || index == "_all" {
+		return errRawHistory
+	}
+	if cfg.TopN.RawFrom != "" {
+		from, err := parseTime(cfg.TopN.RawFrom)
+		if err != nil || from < 0 || min < from {
+			return errRawHistory
+		}
 	}
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
-		Status(w, BudgetExceeded)
-		return
+		return errBudget
 	}
-	call, ok := monitoredStore()
-	if !ok {
-		Status(w, Unsupported)
-		return
+	call, version := monitoredStore()
+	if call == nil {
+		return errUnavailable
 	}
 	select {
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
-		Status(w, BudgetExceeded)
-		return
+		return errBudget
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	err = func() error {
-		s, err := open(ctx, call, cfg.TopN.RawIndex)
+	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, min, cfg.TopN.RawFrom == "")
+}
+
+func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric, scanStart int64, checkHistory bool) error {
+	single := func() error { return singleSearch(ctx, call, index, pred, q, metric, scanStart, checkHistory) }
+	singleFirst := q.Source == "node_stats" || api.path == ""
+	if singleFirst {
+		err := single()
+		if err == nil || errors.Is(err, errRawHistory) || api.path == "" || ctx.Err() != nil {
+			return err
+		}
+	}
+	s, err := open(ctx, call, index, api)
+	if err != nil {
+		if !singleFirst && ctx.Err() == nil {
+			return single()
+		}
+		return err
+	}
+	defer s.close()
+	if checkHistory {
+		covered, err := s.retainedAt(ctx, pred, scanStart)
 		if err != nil {
 			return err
 		}
-		defer s.close()
-		if metric.Counter {
-			return counters(ctx, s, q, pred, metric)
+		if !covered {
+			return errRawHistory
 		}
-		return peaks(ctx, s, q, pred, metric)
-	}()
-	if err != nil {
-		if errors.Is(err, errBudget) || errors.Is(err, context.DeadlineExceeded) {
-			Status(w, BudgetExceeded)
-		} else {
-			log.Warnf("automatic monitoring TopN: %v", err)
-			Status(w, QueryFailed)
-		}
-		return
 	}
-	if len(metric.Item.Lines) == 0 {
-		Status(w, NoData)
-		return
+	if metric.mode != peak {
+		return paged(ctx, s, q, pred, metric)
 	}
+	return peaks(ctx, s, q, pred, metric)
+}
+
+func writeMetrics(w http.ResponseWriter, metric Metric) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"metrics": map[string]*common.MetricItem{metric.Item.Key: metric.Item}})
 }

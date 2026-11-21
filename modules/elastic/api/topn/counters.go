@@ -3,8 +3,6 @@ package topn
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sort"
 )
 
 const (
@@ -17,15 +15,20 @@ type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time        *int64  `json:"key"`
-	Count       int     `json:"doc_count"`
-	Value       *scalar `json:"value"`
-	Other       *scalar `json:"other"`
-	Uptime      *scalar `json:"uptime"`
-	FirstUptime *scalar `json:"first_uptime"`
-	Shards      *scalar `json:"shards"`
-	Replicas    *scalar `json:"replicas"`
-	Identity    *struct {
+	Time  *int64  `json:"key"`
+	Count int     `json:"doc_count"`
+	Value *scalar `json:"value"`
+	Other *scalar `json:"other"`
+	JVM   *struct {
+		Hits struct {
+			Rows []struct {
+				Fields map[string][]int64 `json:"fields"`
+			} `json:"hits"`
+		} `json:"hits"`
+	} `json:"jvm_lifetime"`
+	Shards   *scalar `json:"shards"`
+	Replicas *scalar `json:"replicas"`
+	Identity *struct {
 		Buckets []struct {
 			Key   string `json:"key"`
 			Count int    `json:"doc_count"`
@@ -40,7 +43,7 @@ func (p samples) entity() string {
 	return p.Identity.Buckets[0].Key
 }
 
-func counterPoint(previous, current samples, width int64, ratio, node bool) (float64, bool) {
+func counterPoint(previous, current samples, width int64, mode metricMode, node bool) (float64, bool) {
 	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width || previous.Value == nil || current.Value == nil || previous.Value.Value == nil || current.Value.Value == nil {
 		return 0, false
 	}
@@ -48,7 +51,7 @@ func counterPoint(previous, current samples, width int64, ratio, node bool) (flo
 	if id == "" || id != current.entity() {
 		return 0, false
 	}
-	if node && (previous.Uptime == nil || current.Uptime == nil || previous.Uptime.Value == nil || current.Uptime.Value == nil || current.FirstUptime == nil || current.FirstUptime.Value == nil || *current.FirstUptime.Value <= *previous.Uptime.Value) {
+	if node && !sameJVMLifetime(previous, current) {
 		return 0, false
 	}
 	if !node && (changed(previous.Shards, current.Shards) || changed(previous.Replicas, current.Replicas)) {
@@ -59,7 +62,7 @@ func counterPoint(previous, current samples, width int64, ratio, node bool) (flo
 	if a < 0 || b < a {
 		return 0, false
 	}
-	if !ratio {
+	if mode != latency {
 		return (b - a) / (float64(width) / 1000), true
 	}
 	if previous.Other == nil || current.Other == nil || previous.Other.Value == nil || current.Other.Value == nil {
@@ -70,6 +73,41 @@ func counterPoint(previous, current samples, width int64, ratio, node bool) (flo
 		return 0, false
 	}
 	return (b - a) / (d - c), true
+}
+
+const (
+	jvmTimestamp   = "payload.elasticsearch.node_stats.jvm.timestamp"
+	jvmUptime      = "payload.elasticsearch.node_stats.jvm.uptime_in_millis"
+	jvmSampleLimit = 64
+)
+
+// The node's own timestamp and uptime share a clock. Reject a bucket if
+// its lifetime evidence is missing or truncated, even as a baseline.
+func (p samples) jvmLifetime() (int64, int64, bool) {
+	if p.Count <= 0 || p.JVM == nil || len(p.JVM.Hits.Rows) != p.Count {
+		return 0, 0, false
+	}
+	var lo, hi int64
+	for i, row := range p.JVM.Hits.Rows {
+		ts, uptime := row.Fields[jvmTimestamp], row.Fields[jvmUptime]
+		if len(ts) != 1 || len(uptime) != 1 || uptime[0] < 0 || ts[0] <= uptime[0] {
+			return 0, 0, false
+		}
+		start := ts[0] - uptime[0]
+		if i == 0 {
+			lo, hi = start, start
+		} else {
+			lo, hi = min(lo, start), max(hi, start)
+		}
+	}
+	return lo, hi, true
+}
+
+func sameJVMLifetime(previous, current samples) bool {
+	const toleranceMS = 1000
+	a, b, ok := previous.jvmLifetime()
+	c, d, otherOK := current.jvmLifetime()
+	return ok && otherOK && max(b, d)-min(a, c) <= toleranceMS
 }
 
 func changed(a, b *scalar) bool {
@@ -90,7 +128,7 @@ func (q Query) previousBucket() int64 {
 	return q.Min/w*w - w
 }
 
-func counters(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
+func (q Query) counterScope() dsl {
 	width := int64(q.Width) * 1000
 	first := q.Min / width * width
 	// Read the complete preceding bucket, but never include the hidden part of the first visible bucket.
@@ -98,27 +136,60 @@ func counters(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric
 	if first > 0 {
 		scope = append(scope, filterRange(first-width, first-1))
 	}
-	pred["filter"] = append(pred["filter"].([]dsl), dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}})
+	return dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}}
+}
+
+func metricAggs(q Query, metric Metric) dsl {
+	buckets := dsl{"value": maximum(metric.Field)}
+	if metric.Field2 != "" {
+		buckets["other"] = maximum(metric.Field2)
+	}
+	if !metric.mode.difference() {
+		return buckets
+	}
 	node := q.Source == "node_stats"
 	identity := "metadata.labels.index_uuid"
 	if node {
 		identity = "metadata.labels.node_id"
 	}
-	buckets := dsl{"value": maximum(metric.Field), "identity": dsl{"terms": terms(identity, 2)}}
+	buckets["identity"] = dsl{"terms": terms(identity, 2)}
 	if node {
-		const uptime = "payload.elasticsearch.node_stats.jvm.uptime_in_millis"
-		buckets["uptime"] = maximum(uptime)
-		buckets["first_uptime"] = dsl{"min": dsl{"field": uptime}}
+		buckets["jvm_lifetime"] = dsl{"top_hits": dsl{
+			"size": jvmSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
+			"docvalue_fields": []string{jvmTimestamp, jvmUptime},
+		}}
 	} else {
 		buckets["shards"] = maximum("payload.elasticsearch.index_stats.index_info.shards")
 		buckets["replicas"] = maximum("payload.elasticsearch.index_stats.index_info.replicas")
 	}
-	if metric.Field2 != "" {
-		buckets["other"] = maximum(metric.Field2)
+	return buckets
+}
+
+func keepWinner(best []winner, candidate winner, n int) []winner {
+	if candidate.score < 0 {
+		return best
 	}
+	// N is at most 20. Keep the bounded list ordered, never retain whole candidate pages.
+	i := 0
+	for i < len(best) && (best[i].score > candidate.score || (best[i].score == candidate.score && best[i].name < candidate.name)) {
+		i++
+	}
+	if i < n {
+		if len(best) < n {
+			best = append(best, winner{})
+		}
+		copy(best[i+1:], best[i:])
+		best[i] = candidate
+	}
+	return best
+}
+
+func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
+	pred["filter"] = append(pred["filter"].([]dsl), metricScope(q, metric))
+	buckets := metricAggs(q, metric)
 	size := pageSize
 	// Leave headroom for per-point identity buckets plus their histogram parents.
-	if limit := 6000 / (3*int(q.Max/width-q.Min/width+2) + 1); limit < size {
+	if limit := 6000 / (metricBucketCost(q, metric) + 1); limit < size {
 		size = limit
 	}
 	if size < 1 {
@@ -127,6 +198,7 @@ func counters(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric
 	composite := dsl{"size": size, "sources": []dsl{{"entity": dsl{"terms": dsl{"field": q.entity()}}}}}
 	agg := dsl{"composite": composite, "aggs": dsl{"dates": histogram(q.Width, buckets)}}
 	best := make([]winner, 0, q.N)
+	allowed := q.authorizer()
 	var after, last string
 	total := 0
 	for page := 0; page < maxPages; page++ {
@@ -154,7 +226,7 @@ func counters(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric
 		}
 		for _, b := range response.Buckets {
 			name := b.Key.Entity
-			if name == "" || name <= last || name <= after || b.Dates == nil || len(b.Dates.Buckets) == 0 {
+			if !allowed(name) || name == "" || name <= last || name <= after || b.Dates == nil || len(b.Dates.Buckets) == 0 {
 				return errors.New("missing or out-of-order TopN entity")
 			}
 			last = name
@@ -162,49 +234,11 @@ func counters(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric
 			if total > maxPoints {
 				return errBudget
 			}
-			candidate := winner{name: name, score: -1}
-			for _, p := range b.Dates.Buckets {
-				if p.Time == nil {
-					return fmt.Errorf("missing time bucket key for %q", name)
-				}
+			candidate, err := scoreSeries(q, metric, name, b.Dates.Buckets)
+			if err != nil {
+				return err
 			}
-			sort.Slice(b.Dates.Buckets, func(i, j int) bool { return *b.Dates.Buckets[i].Time < *b.Dates.Buckets[j].Time })
-			var previous samples
-			for _, p := range b.Dates.Buckets {
-				if p.Time == nil || *p.Time < first-width || *p.Time > q.Max || *p.Time%width != 0 || (previous.Time != nil && *p.Time <= *previous.Time) {
-					return fmt.Errorf("invalid time bucket %d for %q", *p.Time, name)
-				}
-				if *p.Time >= first {
-					if v, valid := counterPoint(previous, p, width, metric.Field2 != "", node); valid {
-						if previous.Time != nil && len(candidate.points) > 0 {
-							lastPoint := candidate.points[len(candidate.points)-1][0].(int64)
-							if *p.Time-lastPoint > width {
-								candidate.points = append(candidate.points, []interface{}{lastPoint + width, nil})
-							}
-						}
-						candidate.points = append(candidate.points, []interface{}{*p.Time, v})
-						if v > candidate.score {
-							candidate.score = v
-						}
-					}
-				}
-				previous = p
-			}
-			if candidate.score < 0 {
-				continue
-			}
-			// N is at most 20. Keep the bounded list ordered, never retain whole candidate pages.
-			i := 0
-			for i < len(best) && (best[i].score > candidate.score || (best[i].score == candidate.score && best[i].name < candidate.name)) {
-				i++
-			}
-			if i < q.N {
-				if len(best) < q.N {
-					best = append(best, winner{})
-				}
-				copy(best[i+1:], best[i:])
-				best[i] = candidate
-			}
+			best = keepWinner(best, candidate, q.N)
 		}
 		if len(response.Buckets) == 0 || response.After == nil {
 			if len(response.Buckets) == size && response.After == nil {

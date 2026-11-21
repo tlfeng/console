@@ -724,36 +724,29 @@ func (h *APIHandler) HandleClusterMetricsAction(w http.ResponseWriter, req *http
 func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	resBody := map[string]interface{}{}
 	id := ps.ByName("id")
-	if cfg, enrolled := topn.Policy(req, id); enrolled && GetMonitorState(id) == elastic.ModeAgentless && h.Get(req, "node_name", "") == "" {
-		key := h.GetParameter(req, "key")
-		switch key {
-		case NodeProcessCPUMetricKey, NodeOSCPUMetricKey, JVMHeapUsedPercentMetricKey, IndexStorageMetricKey, QueryRateMetricKey, QueryLatencyMetricKey:
-		default:
-			topn.Status(w, topn.Unsupported)
-			return
-		}
-		if topn.Disabled(cfg, "node_stats", key) {
-			topn.Status(w, topn.Unsupported)
-			return
-		}
-		width, _, _, err := h.GetMetricRangeAndBucketSize(req, id, v1.MetricTypeNodeStats, 90)
-		min, max, n, valid := topn.Window(req, width)
-		if err != nil || !valid {
-			topn.Status(w, topn.InvalidRequest)
-			return
-		}
-		def := nodeMetricItemsForKey(key)[0]
-		q := topn.Query{Cluster: id, Source: "node_stats", Min: min, Max: max, Width: width, N: n}
-		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Field2: def.Field2, Counter: def.IsDerivative, Format: def.FormatType, Units: def.Units})
-		return
-	}
-
 	bucketSize, min, max, err := h.GetMetricRangeAndBucketSize(req, id, v1.MetricTypeNodeStats, 90)
 	if err != nil {
 		log.Error(err)
 		resBody["error"] = err
 		h.WriteJSON(w, resBody, http.StatusInternalServerError)
 		return
+	}
+	if req.URL.Query().Get("advanced_topn") == "true" && h.Get(req, "node_name", "") == "" && GetMonitorState(id) == elastic.ModeAgentless {
+		defs := nodeMetricItemsForKey(h.GetParameter(req, "key"))
+		if len(defs) == 1 {
+			def := defs[0]
+			metric, supported := topn.NewMetric(def.MetricItem, def.Field, def.Field2, def.Units, def.FormatType, def.IsDerivative)
+			if supported {
+				min, max, n, valid := topn.Window(req, bucketSize)
+				if !valid {
+					topn.WriteStatus(w, "invalid_request")
+					return
+				}
+				q := topn.Query{Cluster: id, Source: "node_stats", Min: min, Max: max, Width: bucketSize, N: n}
+				topn.Serve(w, req, q, metric)
+				return
+			}
+		}
 	}
 	nodeName := h.Get(req, "node_name", "")
 	top := h.GetIntOrDefault(req, "top", 5)
@@ -768,7 +761,7 @@ func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Re
 		h.WriteError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), du)
+	ctx, cancel := context.WithTimeout(req.Context(), du)
 	defer cancel()
 	metrics, err := h.getNodeMetrics(ctx, id, bucketSize, min, max, nodeName, top, key)
 	if err != nil {

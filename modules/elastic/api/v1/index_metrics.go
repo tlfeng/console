@@ -135,6 +135,23 @@ func (h *APIHandler) getIndexMetrics(ctx context.Context, req *http.Request, clu
 			log.Error(err)
 		}
 
+		allowed, all := h.GetAllowedIndices(req, clusterID)
+		if !all {
+			if len(allowed) == 0 || len(indexNames) == 0 {
+				return nil, nil
+			}
+			matcher := radix.Compile(allowed...)
+			filtered := indexNames[:0]
+			for _, name := range indexNames {
+				if matcher.Match(name) {
+					filtered = append(filtered, name)
+				}
+			}
+			if len(filtered) == 0 {
+				return nil, nil
+			}
+			indexNames = filtered
+		}
 	}
 	if len(indexNames) > 0 {
 		must = append(must, util.MapStr{

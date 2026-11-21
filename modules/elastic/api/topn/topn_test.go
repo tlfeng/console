@@ -2,12 +2,15 @@ package topn
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
 
+	"infini.sh/framework/core/elastic"
 	"infini.sh/framework/modules/elastic/common"
 )
 
@@ -47,7 +50,7 @@ func TestPeakSnapshot(t *testing.T) {
 		return nil, nil
 	}
 	ctx := context.Background()
-	s, err := open(ctx, call, "raw")
+	s, err := open(ctx, call, "raw", pitFor(elastic.Version{Distribution: elastic.Easysearch}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,5 +97,37 @@ func TestIncompleteSnapshotSearch(t *testing.T) {
 	}
 	if err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil || s.id != "rotated" {
 		t.Fatalf("err=%v pit=%s", err, s.id)
+	}
+}
+
+func TestFailureStatus(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errRawHistory, "history_unavailable"},
+		{fmt.Errorf("search: %w", errBudget), "budget_exceeded"},
+		{context.DeadlineExceeded, "timed_out"},
+		{errUnavailable, "unavailable"},
+		{errors.New("backend details"), "query_failed"},
+	} {
+		w := httptest.NewRecorder()
+		WriteStatus(w, failureStatus(tc.err))
+		var got map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got) != 1 || got["topn_status"] != tc.want {
+			t.Fatalf("%v: response %s, want only status %q", tc.err, w.Body, tc.want)
+		}
+	}
+}
+
+func TestCompleteEmptyResult(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeMetrics(w, Metric{Item: &common.MetricItem{Key: "cpu", Lines: []*common.MetricLine{}}})
+	var got struct {
+		Status  string                        `json:"topn_status"`
+		Metrics map[string]*common.MetricItem `json:"metrics"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || got.Status != "" || got.Metrics["cpu"] == nil || len(got.Metrics["cpu"].Lines) != 0 {
+		t.Fatalf("expected successful empty chart, got %s", w.Body)
 	}
 }

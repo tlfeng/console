@@ -88,10 +88,9 @@ export default (props) => {
         ...(controller ? { signal: controller.signal } : {})
       }, false, false)
       if (controller?.signal.aborted) return;
-      if (res?.topn_status) {
-        const status = res.topn_status;
+      if (advancedTopN && res?.topn_status) {
         setMetric(undefined);
-        setError(status === 'no_data' ? undefined : formatMessage({ id: `cluster.metrics.topn.${status}` }));
+        setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }));
       } else if (res?.error) {
         const error = formatResponse(res);
         setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
