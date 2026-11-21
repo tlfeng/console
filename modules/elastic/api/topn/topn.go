@@ -109,8 +109,9 @@ func parseTime(raw string) (int64, error) {
 }
 
 type Metric struct {
-	Item                 *common.MetricItem
-	Field, Units, Format string
+	Item                         *common.MetricItem
+	Field, Field2, Units, Format string
+	Counter                      bool
 }
 
 type Query struct {
@@ -159,7 +160,7 @@ func (q Query) entity() string {
 }
 
 func filterRange(min, max int64) dsl {
-	return dsl{"range": dsl{"timestamp": dsl{"gte": min, "lte": max}}}
+	return dsl{"range": dsl{"timestamp": dsl{"gte": min, "lte": max, "format": "epoch_millis"}}}
 }
 func maximum(field string) dsl { return dsl{"max": dsl{"field": field}} }
 func histogram(width int, aggs dsl) dsl {
@@ -321,7 +322,7 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 func terms(field string, n int) dsl { return dsl{"field": field, "size": n, "shard_size": n} }
 
 func display(q Query, metric Metric, name string, data [][]interface{}) {
-	line := metric.Item.AddLine(metric.Item.Key, name, "", "group1", metric.Field, "max", fmt.Sprintf("%ds", q.Width), metric.Units, metric.Format, "0.[00]", "0.[00]", false, false)
+	line := metric.Item.AddLine(metric.Item.Key, name, "", "group1", metric.Field, "max", fmt.Sprintf("%ds", q.Width), metric.Units, metric.Format, "0.[00]", "0.[00]", false, metric.Counter)
 	line.TimeRange = common.TimeRange{Min: q.Min, Max: q.Max}
 	line.Data = data
 }
@@ -399,8 +400,12 @@ func Run(w http.ResponseWriter, r *http.Request, cfg config, q Query, metric Met
 		Status(w, Unsupported)
 		return
 	}
+	min := q.Min
+	if metric.Counter && q.previousBucket() >= 0 {
+		min = q.previousBucket()
+	}
 	from, err := parseTime(cfg.TopN.RawFrom)
-	if err != nil || from < 0 || q.Min < from || !rawName.MatchString(cfg.TopN.RawIndex) || cfg.TopN.RawIndex == "_all" {
+	if err != nil || from < 0 || min < from || !rawName.MatchString(cfg.TopN.RawIndex) || cfg.TopN.RawIndex == "_all" {
 		Status(w, HistoryUnavailable)
 		return
 	}
@@ -428,6 +433,9 @@ func Run(w http.ResponseWriter, r *http.Request, cfg config, q Query, metric Met
 			return err
 		}
 		defer s.close()
+		if metric.Counter {
+			return counters(ctx, s, q, pred, metric)
+		}
 		return peaks(ctx, s, q, pred, metric)
 	}()
 	if err != nil {

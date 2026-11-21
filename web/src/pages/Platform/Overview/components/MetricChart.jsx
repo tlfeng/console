@@ -57,11 +57,18 @@ export default (props) => {
     const containerRef = useRef(null)
   
     const firstFetchRef = useRef(true)
+    const activeRequestRef = useRef()
 
     const [timeInterval, setTimeInterval] = useState()
   
     const fetchData = async (queryParams, fetchUrl, metricKey, timeInterval, showLoading) => {
       if (!observerRef.current.isInView || !fetchUrl) return;
+      let controller;
+      if (advancedTopN) {
+        activeRequestRef.current?.abort();
+        controller = new AbortController();
+        activeRequestRef.current = controller;
+      }
       if (firstFetchRef.current || showLoading) {
         setLoading(true)
       }
@@ -77,18 +84,14 @@ export default (props) => {
       const res = await request(fetchUrl, {
         method: 'GET',
         queryParams: newQueryParams,
-        ignoreTimeout: true
+        ignoreTimeout: true,
+        ...(controller ? { signal: controller.signal } : {})
       }, false, false)
+      if (controller?.signal.aborted) return;
       if (res?.topn_status) {
-        const messages = {
-          unsupported: 'Automatic TopN is unavailable. Select an index or node to view its metrics.',
-          history_unavailable: 'Original monitoring data is not available for this entire window. Select a more recent window or choose an index or node.',
-          invalid_request: 'Invalid TopN time range or chart settings.',
-          budget_exceeded: 'Automatic TopN exceeded its query limit. Try a shorter window, a coarser interval, or select an index or node.',
-          query_failed: 'Automatic TopN could not be calculated. Try again or select an index or node.'
-        };
+        const status = res.topn_status;
         setMetric(undefined);
-        setError(res.topn_status === 'no_data' ? undefined : (messages[res.topn_status] || messages.query_failed));
+        setError(status === 'no_data' ? undefined : formatMessage({ id: `cluster.metrics.topn.${status}` }));
       } else if (res?.error) {
         const error = formatResponse(res);
         setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
@@ -98,7 +101,7 @@ export default (props) => {
         setError()
         setMetric(formatMetric && metric ? formatMetric(metric) : metric);
       }
-      if (firstFetchRef.current || showLoading) {
+      if (advancedTopN || firstFetchRef.current || showLoading) {
         setLoading(false)
         firstFetchRef.current = false
       }
@@ -110,7 +113,11 @@ export default (props) => {
   
     useEffect(() => {
       observerRef.current.deps = cloneDeep([queryParams, fetchUrl, metricKey, timeInterval, refresh])
+      if (advancedTopN && observerRef.current.isInView) {
+        observerRef.current.lastDeps = cloneDeep(observerRef.current.deps);
+      }
       fetchData(queryParams, fetchUrl, metricKey, timeInterval, refresh)
+      return () => activeRequestRef.current?.abort();
     }, [JSON.stringify(queryParams), fetchUrl, metricKey, timeInterval, refresh])
   
     useEffect(() => {

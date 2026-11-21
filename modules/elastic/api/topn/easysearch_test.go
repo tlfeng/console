@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 	if os.Getenv("CONSOLE_TOPN_INTEGRATION") != "1" {
 		t.Skip("set CONSOLE_TOPN_INTEGRATION=1 for a disposable Easysearch on localhost:19219")
 	}
+	const epoch = 1780000000000
 	const base = "http://127.0.0.1:19219"
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -65,11 +67,11 @@ func TestEasysearchSnapshot(t *testing.T) {
 	}
 	must("PUT", "/"+index, dsl{"settings": dsl{"number_of_shards": 3, "number_of_replicas": 0}, "mappings": dsl{"properties": dsl{
 		"timestamp": dsl{"type": "date"}, "metric": dsl{"type": "long"}, "metadata": dsl{"properties": dsl{
-			"name": dsl{"type": "keyword"}, "category": dsl{"type": "keyword"}, "labels": dsl{"properties": dsl{"cluster_id": dsl{"type": "keyword"}, "index_name": dsl{"type": "keyword"}}},
+			"name": dsl{"type": "keyword"}, "category": dsl{"type": "keyword"}, "labels": dsl{"properties": dsl{"cluster_id": dsl{"type": "keyword"}, "index_name": dsl{"type": "keyword"}, "index_uuid": dsl{"type": "keyword"}}},
 		}}}}})
 	defer func() { _, _ = call(context.Background(), "DELETE", "/"+index, nil) }()
 	add := func(id, name string, ts, val int) {
-		must("PUT", "/"+index+"/_doc/"+id+"?refresh=true", dsl{"timestamp": ts, "metric": val, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "biz", "index_name": name}}})
+		must("PUT", "/"+index+"/_doc/"+id+"?refresh=true", dsl{"timestamp": epoch + ts, "metric": val, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "biz", "index_name": name, "index_uuid": "id-" + name}}})
 	}
 	add("a1", "a", 1001, 10)
 	add("a2", "a", 2001, 50)
@@ -81,7 +83,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 	}
 	defer s.close()
 	add("late", "b", 2001, 999)
-	q := Query{Cluster: "biz", Source: "index_stats", Min: 1001, Max: 2999, Width: 1, N: 1, Indices: []string{"a", "b"}}
+	q := Query{Cluster: "biz", Source: "index_stats", Min: epoch + 1001, Max: epoch + 2999, Width: 1, N: 1, Indices: []string{"a", "b"}}
 	pred, ok := q.filter()
 	if !ok {
 		t.Fatal("valid permissions rejected")
@@ -93,4 +95,27 @@ func TestEasysearchSnapshot(t *testing.T) {
 	if len(m.Item.Lines) != 1 || m.Item.Lines[0].Metric.Label != "a" || len(m.Item.Lines[0].Data.([][]interface{})) != 2 {
 		t.Fatalf("unexpected ranking: %+v", m.Item.Lines)
 	}
+	for i := 0; i < 65; i++ {
+		name := fmt.Sprintf("page-%03d", i)
+		add(name+"-1", name, 1001, 1)
+		add(name+"-2", name, 2001, i+2)
+	}
+	paged, err := open(ctx, call, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer paged.close()
+	q.Indices = []string{"page-*"}
+	pred, ok = q.filter()
+	if !ok {
+		t.Fatal("valid wildcard authorization rejected")
+	}
+	m = Metric{Item: &common.MetricItem{Key: "query_times"}, Field: "metric", Counter: true}
+	if err := counters(ctx, paged, q, pred, m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Item.Lines) != 1 || m.Item.Lines[0].Metric.Label != "page-064" || !reflect.DeepEqual(m.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 2000), 65.0}}) {
+		t.Fatalf("expected the later-page winner and its rate, got %+v", m.Item.Lines)
+	}
+
 }

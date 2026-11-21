@@ -566,7 +566,7 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 	if cfg, enrolled := topn.Policy(req, id); enrolled && h.Get(req, "index_name", "") == "" {
 		key := h.GetParameter(req, "key")
 		switch key {
-		case IndexStorageMetricKey, DocCountMetricKey, SegmentCountMetricKey:
+		case IndexStorageMetricKey, DocCountMetricKey, SegmentCountMetricKey, QueryTimesMetricKey, IndexingRateMetricKey:
 		default:
 			topn.Status(w, topn.Unsupported)
 			return
@@ -584,7 +584,7 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		def := indexMetricItemsForKey(key)[0]
 		q := topn.Query{Cluster: id, Source: "index_stats", Min: min, Max: max, Width: width, N: n}
 		q.Indices, q.AllIndices = h.GetAllowedIndices(req, id)
-		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Format: def.FormatType, Units: def.Units})
+		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Field2: def.Field2, Counter: def.IsDerivative, Format: def.FormatType, Units: def.Units})
 		return
 	}
 

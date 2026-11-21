@@ -1,4 +1,9 @@
 export default {
+  "cluster.metrics.topn.unsupported": "此指标暂不支持自动 TopN，请手选索引或节点查看。",
+  "cluster.metrics.topn.history_unavailable": "原始监控数据未覆盖整个时间范围，请选择较近的时间范围或手选对象。",
+  "cluster.metrics.topn.invalid_request": "TopN 的时间范围或图表设置无效。",
+  "cluster.metrics.topn.budget_exceeded": "自动 TopN 超过查询限额，请缩短时间范围、选择更粗粒度或手选对象。",
+  "cluster.metrics.topn.query_failed": "自动 TopN 查询失败，请重试或手选对象。",
   "cluster.manage.title": "集群管理",
   "cluster.manage.description":
     "集群管理可以帮助您快速接入不同版本的 Elasticsearch 集群，以及删除和修改集群配置。",

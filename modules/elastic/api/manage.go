@@ -727,7 +727,7 @@ func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Re
 	if cfg, enrolled := topn.Policy(req, id); enrolled && GetMonitorState(id) == elastic.ModeAgentless && h.Get(req, "node_name", "") == "" {
 		key := h.GetParameter(req, "key")
 		switch key {
-		case NodeProcessCPUMetricKey, NodeOSCPUMetricKey, JVMHeapUsedPercentMetricKey, IndexStorageMetricKey:
+		case NodeProcessCPUMetricKey, NodeOSCPUMetricKey, JVMHeapUsedPercentMetricKey, IndexStorageMetricKey, QueryRateMetricKey, QueryLatencyMetricKey:
 		default:
 			topn.Status(w, topn.Unsupported)
 			return
@@ -744,7 +744,7 @@ func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Re
 		}
 		def := nodeMetricItemsForKey(key)[0]
 		q := topn.Query{Cluster: id, Source: "node_stats", Min: min, Max: max, Width: width, N: n}
-		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Format: def.FormatType, Units: def.Units})
+		topn.Run(w, req, cfg, q, topn.Metric{Item: def.MetricItem, Field: def.Field, Field2: def.Field2, Counter: def.IsDerivative, Format: def.FormatType, Units: def.Units})
 		return
 	}
 

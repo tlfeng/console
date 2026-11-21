@@ -1,4 +1,9 @@
 export default {
+  "cluster.metrics.topn.unsupported": "Automatic TopN is unavailable. Select an index or node to view its metrics.",
+  "cluster.metrics.topn.history_unavailable": "Original monitoring data does not cover this window. Select a more recent window or choose an index or node.",
+  "cluster.metrics.topn.invalid_request": "Invalid TopN time range or chart settings.",
+  "cluster.metrics.topn.budget_exceeded": "Automatic TopN exceeded its query limit. Try a shorter window, a coarser interval, or select an index or node.",
+  "cluster.metrics.topn.query_failed": "Automatic TopN could not be calculated. Try again or select an index or node.",
   "cluster.manage.title": "CLUSTERS",
   "cluster.manage.description":
     "Cluster management can help you quickly access different versions of Elasticsearch clusters, as well as delete and modify cluster configurations.",
