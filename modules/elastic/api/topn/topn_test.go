@@ -131,3 +131,24 @@ func TestCompleteEmptyResult(t *testing.T) {
 		t.Fatalf("expected successful empty chart, got %s", w.Body)
 	}
 }
+
+func TestHistogramVersionCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		version elastic.Version
+		key     string
+	}{
+		{elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "interval"},
+		{elastic.Version{Number: "7.1.1"}, "interval"},
+		{elastic.Version{Distribution: elastic.Elasticsearch, Number: "7.2.0"}, "fixed_interval"},
+		{elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.16.0"}, "fixed_interval"},
+		{elastic.Version{Distribution: elastic.Easysearch, Number: "2.1.2"}, "fixed_interval"},
+		{elastic.Version{Distribution: elastic.Opensearch, Number: "2.4.0"}, "fixed_interval"},
+	} {
+		q := Query{Width: 20}
+		q.setSearchVersion(tc.version)
+		hist := q.histogram(dsl{})["date_histogram"].(dsl)
+		if len(hist) != 3 || hist[tc.key] != "20s" {
+			t.Errorf("%+v: expected %s=20s, got %v", tc.version, tc.key, hist)
+		}
+	}
+}

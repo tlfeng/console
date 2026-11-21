@@ -247,7 +247,7 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 		return errBudget
 	}
 	composite := dsl{"size": size, "sources": []dsl{{"entity": dsl{"terms": dsl{"field": q.entity()}}}}}
-	agg := dsl{"composite": composite, "aggs": dsl{"dates": histogram(q.Width, buckets)}}
+	agg := dsl{"composite": composite, "aggs": dsl{"dates": q.histogram(buckets)}}
 	best := make([]winner, 0, q.N)
 	allowed := q.authorizer()
 	var after, last string

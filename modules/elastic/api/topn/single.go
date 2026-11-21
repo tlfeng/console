@@ -21,7 +21,7 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	// Every shard containing a globally first L+1 key also has it in its
 	// local first L+1. Fewer than L+1 results therefore prove completeness.
 	aggs := dsl{"scan": dsl{"filter": metricScope(q, metric), "aggs": dsl{"entities": dsl{
-		"terms": entityTerms, "aggs": dsl{"dates": histogram(q.Width, metricAggs(q, metric))},
+		"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))},
 	}}}}
 	if checkHistory {
 		aggs["coverage"] = dsl{"filter": filterRange(0, q.Min)}
@@ -30,7 +30,8 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		// Check availability in the same read as the data, not in a separate live search.
 		aggs["missing_jvm_start"] = missingJVMStarts(q)
 	}
-	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false&expand_wildcards=open,hidden"
+	// The target is a concrete index or alias. ES 6.8 does not support hidden wildcard expansion.
+	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false"
 	raw, err := call(ctx, http.MethodPost, path, dsl{
 		"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": aggs,
 	})

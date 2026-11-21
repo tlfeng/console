@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,4 +302,96 @@ func TestEasysearchSnapshot(t *testing.T) {
 		t.Log("reproduced: earlier raw data makes both paths accept a window whose missing middle backing index contained the winner")
 	})
 
+}
+
+// Verify the actual 6.8 search parser, not just the generated DSL.
+func TestElasticsearch68SingleSearch(t *testing.T) {
+	if os.Getenv("CONSOLE_TOPN_ES68_INTEGRATION") != "1" {
+		t.Skip("set CONSOLE_TOPN_ES68_INTEGRATION=1 for disposable Elasticsearch 6.8 on localhost:19220")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	call := func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
+		var b []byte
+		if body != nil {
+			b, _ = json.Marshal(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, "http://127.0.0.1:19220"+path, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer res.Body.Close()
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+		if res.StatusCode >= 300 {
+			return nil, fmt.Errorf("%s %s: %s", method, path, raw)
+		}
+		return raw, nil
+	}
+	must := func(method, path string, body dsl) []byte {
+		t.Helper()
+		raw, err := call(ctx, method, path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	var info struct {
+		Cluster string `json:"cluster_name"`
+		Version struct {
+			Number string `json:"number"`
+		} `json:"version"`
+	}
+	if json.Unmarshal(must("GET", "/", nil), &info) != nil || info.Cluster != "console-topn-local-bench" || !strings.HasPrefix(info.Version.Number, "6.8.") {
+		t.Fatal("not the disposable Elasticsearch 6.8 test cluster")
+	}
+	index := fmt.Sprintf(".console-topn-es68-%d", time.Now().UnixNano())
+	must("PUT", "/"+index, dsl{"settings": dsl{"number_of_shards": 2, "number_of_replicas": 0}, "mappings": dsl{"_doc": dsl{"properties": dsl{
+		"timestamp": dsl{"type": "date"},
+		"metadata": dsl{"properties": dsl{"category": dsl{"type": "keyword"}, "name": dsl{"type": "keyword"}, "labels": dsl{"properties": dsl{
+			"cluster_id": dsl{"type": "keyword"}, "index_name": dsl{"type": "keyword"}, "index_uuid": dsl{"type": "keyword"},
+		}}}},
+	}}}})
+	defer func() { _, _ = call(ctx, "DELETE", "/"+index, nil) }()
+	const epoch int64 = 1780000000000
+	for _, row := range []struct {
+		name            string
+		offset          int64
+		stored, counter int
+	}{{"a", 0, 50, 0}, {"a", 1000, 50, 1}, {"b", 0, 20, 0}, {"b", 1000, 20, 8}} {
+		must("POST", "/"+index+"/_doc?refresh=true", dsl{"timestamp": epoch + row.offset, "store": row.stored, "counter": row.counter, "metadata": dsl{"category": "elasticsearch", "name": "index_stats", "labels": dsl{"cluster_id": "es68", "index_name": row.name, "index_uuid": row.name}}})
+	}
+	version := elastic.Version{Distribution: elastic.Elasticsearch, Number: info.Version.Number}
+	for _, tc := range []struct {
+		key, field, name string
+		derived          bool
+		value            float64
+		at               int64
+	}{{"index_storage", "store", "a", false, 50, epoch}, {"indexing_rate", "counter", "b", true, 8, epoch + 1000}} {
+		q := Query{Cluster: "es68", Source: "index_stats", Min: epoch, Max: epoch + 1999, Width: 1, N: 1, AllIndices: true}
+		q.setSearchVersion(version)
+		pred, _ := q.filter()
+		metric, ok := NewMetric(&common.MetricItem{Key: tc.key}, tc.field, "", "", "", tc.derived)
+		if !ok {
+			t.Fatal(tc.key)
+		}
+		if err := runQuery(ctx, call, pitFor(version), index, pred, q, metric, true); err != nil {
+			t.Fatal(err)
+		}
+		lines := metric.Item.Lines
+		if len(lines) != 1 || lines[0].Metric.Label != tc.name {
+			t.Fatalf("%s: unexpected winner: %+v", tc.key, lines)
+		}
+		points := lines[0].Data.([][]interface{})
+		if len(points) == 0 || !reflect.DeepEqual(points[0], []interface{}{tc.at, tc.value}) {
+			t.Fatalf("%s: unexpected points: %v", tc.key, points)
+		}
+	}
 }

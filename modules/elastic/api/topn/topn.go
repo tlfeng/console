@@ -80,6 +80,7 @@ type Query struct {
 	AllIndices      bool
 	Indices         []string
 	rawFrom         int64
+	legacyInterval  bool
 }
 
 type dsl = map[string]interface{}
@@ -132,8 +133,21 @@ func filterRange(min, max int64) dsl {
 	return dsl{"range": dsl{"timestamp": dsl{"gte": min, "lte": max, "format": "epoch_millis"}}}
 }
 func maximum(field string) dsl { return dsl{"max": dsl{"field": field}} }
-func histogram(width int, aggs dsl) dsl {
-	return dsl{"date_histogram": dsl{"field": "timestamp", "fixed_interval": fmt.Sprintf("%ds", width), "min_doc_count": 1}, "aggs": aggs}
+func (q Query) histogram(aggs dsl) dsl {
+	field := "fixed_interval"
+	if q.legacyInterval {
+		field = "interval"
+	}
+	return dsl{"date_histogram": dsl{"field": "timestamp", field: fmt.Sprintf("%ds", q.Width), "min_doc_count": 1}, "aggs": aggs}
+}
+
+func (q *Query) setSearchVersion(version elastic.Version) {
+	if version.Distribution != elastic.Elasticsearch && version.Distribution != "" {
+		return
+	}
+	if cmp, err := util.VersionCompare(version.Number, "7.2.0"); err == nil {
+		q.legacyInterval = cmp < 0
+	}
 }
 
 var aclPattern = regexp.MustCompile(`^[a-z0-9._+*\-]+$`)
@@ -362,7 +376,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var curves struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": histogram(q.Width, dsl{"value": maximum(metric.Field)})}}, &curves); err != nil {
+	if err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves); err != nil {
 		return err
 	}
 	if len(curves.Buckets) != len(names) {
@@ -491,6 +505,7 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	q.setSearchVersion(version)
 	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
 }
 
