@@ -43,7 +43,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 			}
 			pred, _ := q.filter()
 			metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
-			err := singleSearch(context.Background(), call, "raw", pred, q, metric, q.Min, true)
+			err := singleSearch(context.Background(), call, "raw", pred, q, metric, true)
 			if calls != 1 {
 				t.Fatalf("got %d requests", calls)
 			}

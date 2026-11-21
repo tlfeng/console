@@ -24,6 +24,7 @@ import (
 
 var (
 	errBudget     = errors.New("automatic TopN budget exceeded")
+	errLegacyJVM  = errors.New("some node samples still require individual JVM evidence")
 	errRawHistory = errors.New("automatic TopN raw history unavailable")
 )
 
@@ -78,6 +79,7 @@ type Query struct {
 	Width, N        int
 	AllIndices      bool
 	Indices         []string
+	rawFrom         int64
 }
 
 type dsl = map[string]interface{}
@@ -387,7 +389,8 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
-// retainedAt checks for original samples at or before the scan boundary on
+// retainedAt checks for original samples at or before the visible window starts,
+// not at the start of the optional counter pre-read bucket. It uses
 // the same snapshot. This is a history guard, not a guarantee of collection
 // completeness or of retention for every entity.
 func (s *snapshot) retainedAt(ctx context.Context, pred dsl, min int64) (bool, error) {
@@ -457,10 +460,6 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	if !ok {
 		return errUnavailable
 	}
-	min := q.Min
-	if metric.mode.difference() && q.previousBucket() >= 0 {
-		min = q.previousBucket()
-	}
 	index := cfg.TopN.RawIndex
 	if index == "" {
 		// Use the original write alias, not the legacy search wildcard that
@@ -472,9 +471,10 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	}
 	if cfg.TopN.RawFrom != "" {
 		from, err := parseTime(cfg.TopN.RawFrom)
-		if err != nil || from < 0 || min < from {
+		if err != nil || from < 0 || q.Min < from {
 			return errRawHistory
 		}
+		q.rawFrom = from
 	}
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
 		return errBudget
@@ -491,20 +491,56 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, min, cfg.TopN.RawFrom == "")
+	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
 }
 
-func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric, scanStart int64, checkHistory bool) error {
-	single := func() error { return singleSearch(ctx, call, index, pred, q, metric, scanStart, checkHistory) }
+func withoutJVMStart() dsl {
+	return dsl{"bool": dsl{"must_not": []dsl{{"range": dsl{jvmStart: dsl{"gt": 0}}}}}}
+}
+
+func missingJVMStarts(q Query) dsl {
+	return dsl{"filter": dsl{"bool": dsl{"filter": []dsl{q.counterScope(), withoutJVMStart()}}}}
+}
+
+func hasMissingJVMStarts(raw json.RawMessage) (bool, error) {
+	var result struct {
+		Count *int64 `json:"doc_count"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return false, err
+	}
+	if result.Count == nil {
+		return false, errors.New("missing JVM evidence count")
+	}
+	return *result.Count > 0, nil
+}
+
+func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+	nodeDifference := q.Source == "node_stats" && metric.mode.difference()
+	single := func() error {
+		m := metric
+		m.jvmSummary = nodeDifference
+		err := singleSearch(ctx, call, index, pred, q, m, checkHistory)
+		if errors.Is(err, errLegacyJVM) && api.path == "" && ctx.Err() == nil {
+			// The second single search collects all its own evidence, so it need
+			// not share a view with the unsuccessful summary search.
+			return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+		}
+		return err
+	}
+	var singleErr error
 	singleFirst := q.Source == "node_stats" || api.path == ""
 	if singleFirst {
-		err := single()
-		if err == nil || errors.Is(err, errRawHistory) || api.path == "" || ctx.Err() != nil {
-			return err
+		singleErr = single()
+		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
+			return singleErr
 		}
 	}
 	s, err := open(ctx, call, index, api)
 	if err != nil {
+		if errors.Is(singleErr, errLegacyJVM) && ctx.Err() == nil {
+			return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+		}
 		if !singleFirst && ctx.Err() == nil {
 			return single()
 		}
@@ -512,13 +548,24 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 	}
 	defer s.close()
 	if checkHistory {
-		covered, err := s.retainedAt(ctx, pred, scanStart)
+		covered, err := s.retainedAt(ctx, pred, q.Min)
 		if err != nil {
 			return err
 		}
 		if !covered {
 			return errRawHistory
 		}
+	}
+	if nodeDifference {
+		var raw json.RawMessage
+		if err := s.search(ctx, pred, missingJVMStarts(q), &raw); err != nil {
+			return err
+		}
+		missing, err := hasMissingJVMStarts(raw)
+		if err != nil {
+			return err
+		}
+		metric.jvmSummary = !missing
 	}
 	if metric.mode != peak {
 		return paged(ctx, s, q, pred, metric)

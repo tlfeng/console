@@ -7,8 +7,12 @@ import (
 	"net/http"
 )
 
-func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric, scanStart int64, checkHistory bool) error {
-	limit := min(192, 5998/(metricBucketCost(q, metric)+1)-1)
+func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+	budget := 5998 // Reserve the scan and history filter buckets.
+	if metric.jvmSummary {
+		budget-- // The same-search JVM availability filter.
+	}
+	limit := min(192, budget/(metricBucketCost(q, metric)+1)-1)
 	if limit < 1 {
 		return errBudget
 	}
@@ -20,7 +24,11 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		"terms": entityTerms, "aggs": dsl{"dates": histogram(q.Width, metricAggs(q, metric))},
 	}}}}
 	if checkHistory {
-		aggs["coverage"] = dsl{"filter": filterRange(0, scanStart)}
+		aggs["coverage"] = dsl{"filter": filterRange(0, q.Min)}
+	}
+	if metric.jvmSummary {
+		// Check availability in the same read as the data, not in a separate live search.
+		aggs["missing_jvm_start"] = missingJVMStarts(q)
 	}
 	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false&expand_wildcards=open,hidden"
 	raw, err := call(ctx, http.MethodPost, path, dsl{
@@ -51,6 +59,15 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		}
 		if coverage.Count == nil || *coverage.Count == 0 {
 			return errRawHistory
+		}
+	}
+	if metric.jvmSummary {
+		missing, err := hasMissingJVMStarts(response.Aggs["missing_jvm_start"])
+		if err != nil {
+			return err
+		}
+		if missing {
+			return errLegacyJVM
 		}
 	}
 	var scan struct {

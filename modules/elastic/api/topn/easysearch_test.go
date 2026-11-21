@@ -111,7 +111,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 	}
 	single := Metric{Item: &common.MetricItem{Key: "index_storage"}, Field: "metric"}
 	pred, _ = q.filter()
-	if err := singleSearch(ctx, call, alias, pred, q, single, q.Min, true); err != nil {
+	if err := singleSearch(ctx, call, alias, pred, q, single, true); err != nil {
 		t.Fatal(err)
 	}
 	if len(single.Item.Lines) != 1 || single.Item.Lines[0].Metric.Label != "b" || !reflect.DeepEqual(single.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 1000), 50.0}, {int64(epoch + 2000), 999.0}}) {
@@ -143,7 +143,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 
 	pred, _ = q.filter()
 	single = Metric{Item: &common.MetricItem{Key: "query_times"}, Field: "metric", mode: rate}
-	if err := singleSearch(ctx, call, alias, pred, q, single, q.previousBucket(), false); err != nil {
+	if err := singleSearch(ctx, call, alias, pred, q, single, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(single.Item.Lines) != len(m.Item.Lines) || single.Item.Lines[0].Metric.Label != m.Item.Lines[0].Metric.Label || !reflect.DeepEqual(single.Item.Lines[0].Data, m.Item.Lines[0].Data) {
@@ -172,7 +172,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			err = paged(ctx, snap, q, pred, disk)
 			snap.close()
 		} else {
-			err = singleSearch(ctx, call, alias, pred, q, disk, q.Min, false)
+			err = singleSearch(ctx, call, alias, pred, q, disk, false)
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -188,39 +188,62 @@ func TestEasysearchSnapshot(t *testing.T) {
 	}
 
 	t.Run("restart inside bucket", func(t *testing.T) {
-		// One address and node ID, but two JVM lifetimes in the middle bucket.
-		for i, row := range []struct{ offset, uptime, count int }{
-			{1000, 1000, 10}, {20100, 20100, 50}, {24000, 100, 1}, {59000, 35100, 150}, {79000, 55100, 190},
-		} {
-			must("PUT", fmt.Sprintf("/%s/_doc/restart-%d?refresh=true", index, i), dsl{
-				"timestamp": epoch + row.offset, "metric": row.count, "elapsed": row.count * 3,
-				"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "restart", "transport_address": "n1", "node_id": "same-node"}},
-				"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": dsl{"timestamp": epoch + row.offset, "uptime_in_millis": row.uptime}}}},
+		for _, history := range []string{"legacy", "mixed", "summary"} {
+			t.Run(history, func(t *testing.T) {
+				// One address and node ID, but two JVM lifetimes in the middle bucket.
+				for i, row := range []struct{ offset, uptime, count int }{
+					{1000, 1000, 10}, {20100, 20100, 50}, {24000, 100, 1}, {59000, 35100, 150}, {79000, 55100, 190},
+				} {
+					jvm := dsl{"timestamp": epoch + row.offset, "uptime_in_millis": row.uptime}
+					if history == "summary" || (history == "mixed" && i%2 == 0) {
+						jvm["start_time_estimate_in_millis"] = epoch + int64(row.offset-row.uptime)
+					}
+					must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-%d?refresh=true", index, history, i), dsl{
+						"timestamp": epoch + row.offset, "metric": row.count, "elapsed": row.count * 3,
+						"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": history, "transport_address": "n1", "node_id": "same-node"}},
+						"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": jvm}}},
+					})
+				}
+				restart := Query{Cluster: history, Source: "node_stats", Min: epoch, Max: epoch + 79999, Width: 20, N: 1}
+				for _, tc := range []struct {
+					key, field, second string
+					mode               metricMode
+					want               float64
+				}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "metric", latency, 3}} {
+					for _, usePIT := range []bool{false, true} {
+						pred, _ := restart.filter()
+						metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
+						var api pitAPI
+						if usePIT {
+							api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
+						}
+						if err := runQuery(ctx, call, api, alias, pred, restart, metric, false); err != nil {
+							t.Fatal(err)
+						}
+						if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
+							t.Fatalf("%s PIT=%v: expected only the recovery point at %v, got %+v", tc.key, usePIT, tc.want, metric.Item.Lines)
+						}
+					}
+				}
 			})
 		}
-		restart := Query{Cluster: "restart", Source: "node_stats", Min: epoch, Max: epoch + 79999, Width: 20, N: 1}
-		for _, tc := range []struct {
-			key, field, second string
-			mode               metricMode
-			want               float64
-		}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "metric", latency, 3}} {
+	})
+
+	t.Run("raw history starts after optional pre-read", func(t *testing.T) {
+		for _, tc := range []struct{ seconds, width int }{{900, 20}, {86400, 600}, {7 * 86400, 5400}} {
 			for _, usePIT := range []bool{false, true} {
-				pred, _ := restart.filter()
-				metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
+				q := Query{Cluster: "biz", Source: "index_stats", Min: epoch + 1001, Max: epoch + 1001 + int64(tc.seconds)*1000, Width: tc.width, N: 1, Indices: []string{"a"}}
+				pred, _ := q.filter()
+				metric := Metric{Item: &common.MetricItem{Key: "query_times"}, Field: "metric", mode: rate}
+				var api pitAPI
 				if usePIT {
-					s, err := open(ctx, call, alias, pitFor(elastic.Version{Distribution: elastic.Easysearch}))
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer s.close()
-					if err := paged(ctx, s, restart, pred, metric); err != nil {
-						t.Fatal(err)
-					}
-				} else if err := singleSearch(ctx, call, alias, pred, restart, metric, restart.Min, false); err != nil {
-					t.Fatal(err)
+					api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 				}
-				if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
-					t.Fatalf("%s PIT=%v: expected only the recovery point at %v, got %+v", tc.key, usePIT, tc.want, metric.Item.Lines)
+				if err := runQuery(ctx, call, api, alias, pred, q, metric, true); err != nil {
+					t.Fatalf("seconds=%d PIT=%v: optional pre-read must not cause history rejection: %v", tc.seconds, usePIT, err)
+				}
+				if len(metric.Item.Lines) != 0 {
+					t.Fatalf("seconds=%d PIT=%v: sparse data must not produce a fake difference", tc.seconds, usePIT)
 				}
 			}
 		}
@@ -251,7 +274,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			if usePIT {
 				api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 			}
-			if err := runQuery(ctx, call, api, historyAlias, pred, q, metric, min, true); err != nil {
+			if err := runQuery(ctx, call, api, historyAlias, pred, q, metric, true); err != nil {
 				return "", err
 			}
 			if len(metric.Item.Lines) == 0 {
@@ -263,9 +286,10 @@ func TestEasysearchSnapshot(t *testing.T) {
 			if got, err := search(usePIT, window.Min); err != nil || got != "middle" {
 				t.Fatalf("PIT=%v complete history: got %q, %v", usePIT, got, err)
 			}
-			if _, err := search(usePIT, epoch); !errors.Is(err, errRawHistory) {
-				t.Fatalf("PIT=%v before first raw sample: got %v", usePIT, err)
-			}
+		}
+		// A window ending before the first sample still rejects.
+		if _, err := search(false, epoch-1000); !errors.Is(err, errRawHistory) {
+			t.Fatalf("window predating raw evidence: got %v", err)
 		}
 		must("POST", "/_aliases", dsl{"actions": []dsl{{"remove": dsl{"index": backing[1], "alias": historyAlias}}}})
 		for _, usePIT := range []bool{false, true} {

@@ -80,3 +80,35 @@ func TestCompositePageFailureDoesNotPublish(t *testing.T) {
 		}
 	}
 }
+
+func TestMixedJVMLifetime(t *testing.T) {
+	const summary = `"doc_count":70,"jvm_start_min":{"value":10000},"jvm_start_max":{"value":10050},"jvm_start_count":{"value":69},`
+	for _, tc := range []struct {
+		name   string
+		legacy string
+		start  int64
+	}{
+		{"one legacy sample with 69 summarized", `"jvm_legacy":{"doc_count":1,"jvm_lifetime":{"hits":{"hits":[{"fields":{"` + jvmTimestamp + `":[11000],"` + jvmUptime + `":[900]}}]}}}`, 10000},
+		{"missing legacy sample", `"jvm_legacy":{"doc_count":1,"jvm_lifetime":{"hits":{"hits":[]}}}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, hi, ok := parseSample(t, "{"+summary+tc.legacy+"}").jvmLifetime()
+			if got != tc.start || ok != (tc.start != 0) || (ok && hi != 10100) {
+				t.Fatalf("got %d..%d valid=%v", got, hi, ok)
+			}
+		})
+	}
+}
+
+func TestRawCoverageDoesNotReadPartialPreviousBucket(t *testing.T) {
+	q := Query{Min: 3500, Max: 5999, Width: 1}
+	for _, tc := range []struct {
+		from int64
+		want int
+	}{{2000, 2}, {2001, 1}, {3500, 1}} {
+		q.rawFrom = tc.from
+		if got := len(q.counterScope()["bool"].(dsl)["should"].([]dsl)); got != tc.want {
+			t.Fatalf("raw_from=%d: got %d ranges, want %d", tc.from, got, tc.want)
+		}
+	}
+}

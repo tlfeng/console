@@ -15,17 +15,18 @@ type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time  *int64  `json:"key"`
-	Count int     `json:"doc_count"`
-	Value *scalar `json:"value"`
-	Other *scalar `json:"other"`
-	JVM   *struct {
-		Hits struct {
-			Rows []struct {
-				Fields map[string][]int64 `json:"fields"`
-			} `json:"hits"`
-		} `json:"hits"`
-	} `json:"jvm_lifetime"`
+	Time      *int64   `json:"key"`
+	Count     int      `json:"doc_count"`
+	Value     *scalar  `json:"value"`
+	Other     *scalar  `json:"other"`
+	JVM       *jvmHits `json:"jvm_lifetime"`
+	JVMLegacy *struct {
+		Count int      `json:"doc_count"`
+		JVM   *jvmHits `json:"jvm_lifetime"`
+	} `json:"jvm_legacy"`
+	JVMMin   *scalar `json:"jvm_start_min"`
+	JVMMax   *scalar `json:"jvm_start_max"`
+	JVMCount *scalar `json:"jvm_start_count"`
 	Shards   *scalar `json:"shards"`
 	Replicas *scalar `json:"replicas"`
 	Identity *struct {
@@ -34,6 +35,14 @@ type samples struct {
 			Count int    `json:"doc_count"`
 		} `json:"buckets"`
 	} `json:"identity"`
+}
+
+type jvmHits struct {
+	Hits struct {
+		Rows []struct {
+			Fields map[string][]int64 `json:"fields"`
+		} `json:"hits"`
+	} `json:"hits"`
 }
 
 func (p samples) entity() string {
@@ -79,16 +88,53 @@ const (
 	jvmTimestamp   = "payload.elasticsearch.node_stats.jvm.timestamp"
 	jvmUptime      = "payload.elasticsearch.node_stats.jvm.uptime_in_millis"
 	jvmSampleLimit = 64
+	jvmStart       = "payload.elasticsearch.node_stats.jvm.start_time_estimate_in_millis"
 )
 
 // The node's own timestamp and uptime share a clock. Reject a bucket if
 // its lifetime evidence is missing or truncated, even as a baseline.
 func (p samples) jvmLifetime() (int64, int64, bool) {
-	if p.Count <= 0 || p.JVM == nil || len(p.JVM.Hits.Rows) != p.Count {
+	if p.Count <= 0 {
+		return 0, 0, false
+	}
+	if p.JVMCount == nil {
+		return hitJVMLifetime(p.JVM, p.Count)
+	}
+	legacy := 0
+	if p.JVMLegacy != nil {
+		legacy = p.JVMLegacy.Count
+	}
+	if legacy < 0 || legacy > p.Count || p.JVMCount.Value == nil || *p.JVMCount.Value != float64(p.Count-legacy) {
 		return 0, 0, false
 	}
 	var lo, hi int64
-	for i, row := range p.JVM.Hits.Rows {
+	if legacy > 0 {
+		var ok bool
+		lo, hi, ok = hitJVMLifetime(p.JVMLegacy.JVM, legacy)
+		if !ok {
+			return 0, 0, false
+		}
+	}
+	if legacy == p.Count {
+		return lo, hi, true
+	}
+	a, haveLo := number(p.JVMMin)
+	b, haveHi := number(p.JVMMax)
+	if !haveLo || !haveHi || !(a > 0 && b >= a && b < 1<<53) || a != float64(int64(a)) || b != float64(int64(b)) {
+		return 0, 0, false
+	}
+	if legacy == 0 {
+		return int64(a), int64(b), true
+	}
+	return min(lo, int64(a)), max(hi, int64(b)), true
+}
+
+func hitJVMLifetime(hits *jvmHits, count int) (int64, int64, bool) {
+	if hits == nil || len(hits.Hits.Rows) != count {
+		return 0, 0, false
+	}
+	var lo, hi int64
+	for i, row := range hits.Hits.Rows {
 		ts, uptime := row.Fields[jvmTimestamp], row.Fields[jvmUptime]
 		if len(ts) != 1 || len(uptime) != 1 || uptime[0] < 0 || ts[0] <= uptime[0] {
 			return 0, 0, false
@@ -133,7 +179,7 @@ func (q Query) counterScope() dsl {
 	first := q.Min / width * width
 	// Read the complete preceding bucket, but never include the hidden part of the first visible bucket.
 	scope := []dsl{filterRange(q.Min, q.Max)}
-	if first > 0 {
+	if first > 0 && first-width >= q.rawFrom {
 		scope = append(scope, filterRange(first-width, first-1))
 	}
 	return dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}}
@@ -154,10 +200,15 @@ func metricAggs(q Query, metric Metric) dsl {
 	}
 	buckets["identity"] = dsl{"terms": terms(identity, 2)}
 	if node {
-		buckets["jvm_lifetime"] = dsl{"top_hits": dsl{
-			"size": jvmSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
-			"docvalue_fields": []string{jvmTimestamp, jvmUptime},
-		}}
+		buckets["jvm_start_min"] = dsl{"min": dsl{"field": jvmStart}}
+		buckets["jvm_start_max"] = maximum(jvmStart)
+		buckets["jvm_start_count"] = dsl{"value_count": dsl{"field": jvmStart}}
+		if !metric.jvmSummary {
+			buckets["jvm_legacy"] = dsl{"filter": withoutJVMStart(), "aggs": dsl{"jvm_lifetime": dsl{"top_hits": dsl{
+				"size": jvmSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
+				"docvalue_fields": []string{jvmTimestamp, jvmUptime},
+			}}}}
+		}
 	} else {
 		buckets["shards"] = maximum("payload.elasticsearch.index_stats.index_info.shards")
 		buckets["replicas"] = maximum("payload.elasticsearch.index_stats.index_info.replicas")

@@ -27,6 +27,7 @@ type Metric struct {
 	Field, Field2, Units, Format string
 	mode                         metricMode
 	reverseRatio                 bool
+	jvmSummary                   bool
 }
 
 // NewMetric uses the chart's fields and units. Only exceptions to the ordinary
@@ -73,8 +74,12 @@ func metricBucketCost(q Query, metric Metric) int {
 	w := int64(q.Width) * 1000
 	n := int(q.Max/w-q.Min/w) + 1
 	if metric.mode.difference() {
-		// Date bucket plus up to two identity buckets.
-		return 3 * (n + 1)
+		// Date bucket plus up to two identity buckets and an optional legacy filter.
+		perPoint := 3
+		if q.Source == "node_stats" && !metric.jvmSummary {
+			perPoint++
+		}
+		return perPoint * (n + 1)
 	}
 	return n
 }
