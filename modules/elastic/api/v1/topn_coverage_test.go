@@ -1,7 +1,7 @@
 package v1
 
 import (
-	"infini.sh/console/modules/elastic/api/topn"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	"testing"
 )
 

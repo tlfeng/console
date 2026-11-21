@@ -27,7 +27,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"infini.sh/console/modules/elastic/api/topn"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	"math"
 	"net/http"
 	"strconv"

@@ -29,7 +29,7 @@ import (
 	"fmt"
 	log "github.com/cihub/seelog"
 	"infini.sh/console/core"
-	"infini.sh/console/modules/elastic/api/topn"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	httprouter "infini.sh/framework/core/api/router"
 	"infini.sh/framework/core/credential"
 	"infini.sh/framework/core/elastic"
