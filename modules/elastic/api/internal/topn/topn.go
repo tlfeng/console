@@ -23,9 +23,10 @@ import (
 )
 
 var (
-	errBudget     = errors.New("automatic TopN budget exceeded")
-	errLegacyJVM  = errors.New("some node samples still require individual JVM evidence")
-	errRawHistory = errors.New("automatic TopN raw history unavailable")
+	errBudget         = errors.New("automatic TopN budget exceeded")
+	errCandidateLimit = fmt.Errorf("single search candidate limit: %w", errBudget)
+	errLegacyJVM      = errors.New("some node samples still require individual JVM evidence")
+	errRawHistory     = errors.New("automatic TopN raw history unavailable")
 )
 
 type config struct {
@@ -80,6 +81,7 @@ type Query struct {
 	AllIndices      bool
 	Indices         []string
 	rawFrom         int64
+	storeScope      string
 	legacyInterval  bool
 }
 
@@ -161,22 +163,22 @@ type requester interface {
 
 type caller func(context.Context, string, string, dsl) ([]byte, error)
 
-func monitoredStore() (caller, elastic.Version) {
+func monitoredStore() (caller, elastic.Version, string) {
 	id, _ := global.Lookup(elastic.GlobalSystemElasticsearchID).(string)
 	if id == "" {
-		return nil, elastic.Version{}
+		return nil, elastic.Version{}, ""
 	}
 	client := elastic.GetClientNoPanic(id)
 	if client == nil {
-		return nil, elastic.Version{}
+		return nil, elastic.Version{}, ""
 	}
 	transport, ok := client.(requester)
 	if !ok {
-		return nil, elastic.Version{}
+		return nil, elastic.Version{}, ""
 	}
 	base := strings.TrimRight(transport.GetEndpoint(), "/")
 	if base == "" {
-		return nil, elastic.Version{}
+		return nil, elastic.Version{}, ""
 	}
 	return func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
 		var wire []byte
@@ -201,7 +203,7 @@ func monitoredStore() (caller, elastic.Version) {
 			return nil, fmt.Errorf("monitoring store returned HTTP %d", res.StatusCode)
 		}
 		return res.Body, nil
-	}, client.GetVersion()
+	}, client.GetVersion(), id + "\x00" + base
 }
 
 type shardCounts struct {
@@ -493,7 +495,7 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
 		return errBudget
 	}
-	call, version := monitoredStore()
+	call, version, scope := monitoredStore()
 	if call == nil {
 		return errUnavailable
 	}
@@ -506,6 +508,7 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	q.setSearchVersion(version)
+	q.storeScope = scope
 	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
 }
 
@@ -543,8 +546,10 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 		}
 		return err
 	}
+	hint, canLearn := nodeRoutingKey(q, metric, api, index, checkHistory)
+	learned := canLearn && pitHints.contains(hint, time.Now())
 	var singleErr error
-	singleFirst := q.Source == "node_stats" || api.path == ""
+	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
 	if singleFirst {
 		singleErr = single()
 		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
@@ -553,11 +558,19 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 	}
 	s, err := open(ctx, call, index, api)
 	if err != nil {
-		if errors.Is(singleErr, errLegacyJVM) && ctx.Err() == nil {
-			return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+		if learned {
+			pitHints.forget(hint)
 		}
-		if !singleFirst && ctx.Err() == nil {
-			return single()
+		if ctx.Err() == nil {
+			if !singleFirst {
+				singleErr = single()
+			}
+			if errors.Is(singleErr, errLegacyJVM) {
+				return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+			}
+			if !singleFirst {
+				return singleErr
+			}
 		}
 		return err
 	}
@@ -583,9 +596,14 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 		metric.jvmSummary = !missing
 	}
 	if metric.mode != peak {
-		return paged(ctx, s, q, pred, metric)
+		err = paged(ctx, s, q, pred, metric)
+	} else {
+		err = peaks(ctx, s, q, pred, metric)
 	}
-	return peaks(ctx, s, q, pred, metric)
+	if err == nil && canLearn && errors.Is(singleErr, errCandidateLimit) && ctx.Err() == nil {
+		pitHints.remember(hint, time.Now())
+	}
+	return err
 }
 
 func writeMetrics(w http.ResponseWriter, metric Metric) {

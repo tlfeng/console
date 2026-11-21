@@ -20,7 +20,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 	}{
 		{name: "complete at limit", count: 192, coverage: 1},
 		{name: "empty", coverage: 1},
-		{name: "sentinel", count: 193, coverage: 1, want: errBudget},
+		{name: "sentinel", count: 193, coverage: 1, want: errCandidateLimit},
 		{name: "history unavailable", count: 1, want: errRawHistory},
 		{name: "partial shards", count: 1, coverage: 1, partial: true, want: errors.New("incomplete monitoring search")},
 	} {

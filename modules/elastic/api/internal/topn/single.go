@@ -88,8 +88,8 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if entities == nil {
 		return errors.New("missing TopN entities")
 	}
-	if len(entities) > limit {
-		return errBudget
+	if len(entities) > limit+1 {
+		return errors.New("oversized TopN entity response")
 	}
 	best := make([]winner, 0, q.N)
 	allowed := q.authorizer()
@@ -102,11 +102,17 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 			return errors.New("invalid TopN entity buckets")
 		}
 		last = b.Key
+		if len(entities) == limit+1 {
+			continue
+		}
 		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
 		if err != nil {
 			return err
 		}
 		best = keepWinner(best, candidate, q.N)
+	}
+	if len(entities) == limit+1 {
+		return errCandidateLimit
 	}
 	for _, row := range best {
 		display(q, metric, row.name, row.points)
