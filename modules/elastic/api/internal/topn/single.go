@@ -40,7 +40,7 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if err != nil {
 		return err
 	}
-	if len(raw) > 16<<20 {
+	if len(raw) > responseLimit {
 		return errBudget
 	}
 	var response searchResponse

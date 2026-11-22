@@ -350,7 +350,7 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if err != nil && len(raw) == 0 {
 		return err
 	}
-	if len(raw) > (16<<20)-s.bytes {
+	if len(raw) > responseLimit-s.bytes {
 		return errBudget
 	}
 	var response searchResponse

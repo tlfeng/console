@@ -10,7 +10,7 @@ import (
 	"infini.sh/framework/core/util"
 )
 
-const responseLimit = 16 << 20
+const responseLimit = 24 << 20
 
 var errResponseBudget = fmt.Errorf("response budget exhausted: %w", errBudget)
 
