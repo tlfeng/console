@@ -259,6 +259,7 @@ func pitFor(version elastic.Version) pitAPI {
 }
 
 type snapshot struct {
+	rawIndexUUIDs map[string]string
 	call          caller
 	api           pitAPI
 	id            string
@@ -510,7 +511,9 @@ func failureStatus(err error) string {
 		return "pending"
 	case errors.Is(err, errSummaryBusy):
 		return "busy"
-	case errors.Is(err, errSummaryHistory):
+	case errors.Is(err, errSummaryPolicyChanged):
+		return "summary_policy_changed"
+	case errors.Is(err, errSummaryHistory), errors.Is(err, errSummaryTargetMissing):
 		return "summary_unavailable"
 	case errors.Is(err, errRawHistory):
 		return "history_unavailable"
@@ -579,9 +582,9 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 		if err != nil {
 			return err
 		}
-		// Polling an existing job is a cache lookup, not an interactive search.
+		// Pending jobs need no search slot; completed jobs acquire one for validation.
 		if cfg.TopN.Materialized.Enabled && poll && api.path != "" {
-			if found, err := onDemandSummaries.lookup(summaryJobKey(m, q, metric), metric); found {
+			if found, err := lookupRetainedJob(ctx, call, api, m, q, metric, time.Now(), summaryJobKey(m, q, metric)); found {
 				return err
 			}
 		}
@@ -590,6 +593,9 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
+		if materialized && cfg.TopN.Materialized.Enabled && poll {
+			return errSummaryBusy
+		}
 		return errBudget
 	}
 	if q.selected != nil {

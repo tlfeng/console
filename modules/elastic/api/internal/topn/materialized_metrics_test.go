@@ -70,13 +70,17 @@ func TestTopNMaterializedMetricCoverage(t *testing.T) {
 	if writeID != "51dda89026ae254ee06cce4c587e443d37a464e074105ba78df3b2bc0f98a06f" {
 		t.Fatalf("write-rate ID changed: %s", writeID)
 	}
-	queryID := m.metricID(q, queryRateKey, 2000)
+	q.Width = 1
+	proof := rawBucketProof{1000: {"i": 1}, 2000: {"i": 1}}
+	digest := proof.transition(2000, 1000)
+	writeID = m.provenID(q, writeRateKey, 2000, digest)
+	queryID := m.provenID(q, queryRateKey, 2000, digest)
 	missing, err := missingMaterialized(context.Background(), func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
-		if !reflect.DeepEqual(body["ids"], []string{writeID, queryID}) {
+		if !reflect.DeepEqual(body["query"], dsl{"ids": dsl{"values": []string{writeID, queryID}}}) {
 			t.Fatalf("wrong ids: %v", body)
 		}
-		return []byte(fmt.Sprintf(`{"docs":[{"_id":%q,"found":true},{"_id":%q,"found":false}]}`, writeID, queryID)), nil
-	}, m, q, []string{writeRateKey, queryRateKey}, []int64{2000})
+		return []byte(fmt.Sprintf(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":%q}]}}`, writeID)), nil
+	}, m, q, []string{writeRateKey, queryRateKey}, []int64{2000}, proof)
 	if err != nil || !reflect.DeepEqual(missing, map[string][]int64{queryRateKey: {2000}}) {
 		t.Fatalf("%v %v", missing, err)
 	}

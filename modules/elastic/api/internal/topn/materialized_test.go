@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"reflect"
 	"testing"
@@ -28,8 +27,8 @@ func TestMaterializedRank(t *testing.T) {
 	q := Query{Cluster: "biz", Source: "index_stats", Min: 1000, Max: 5000, Width: 1, N: 2, Indices: []string{"a*", "b*"}}
 	m := materializedMetric(writeRateKey)
 	buckets := []scoreBucket{
-		{materializedVersion, 5000, []string{"alpha", "beta"}, []float64{2, 0}},
-		{materializedVersion, 1000, []string{"alpha", "beta", "restricted"}, []float64{5, 5, 99}},
+		{materializedVersion, 5000, []string{"alpha", "beta"}, []float64{2, 0}, ""},
+		{materializedVersion, 1000, []string{"alpha", "beta", "restricted"}, []float64{5, 5, 99}, ""},
 	}
 	if err := materializedRank(q, m, buckets); err != nil {
 		t.Fatal(err)
@@ -51,10 +50,11 @@ func TestMaterializedRequiresEveryBucket(t *testing.T) {
 	if !reflect.DeepEqual(sealed, []int64{2000}) || len(edges) != 0 {
 		t.Fatalf("declared gap must only suppress affected transitions: %v %v", sealed, edges)
 	}
+	proof := rawBucketProof{1000: {"i": 1}, 2000: {"i": 1}, 3000: {"i": 1}}
 	s := snapshot{id: "ok", shards: 1, call: func(context.Context, string, string, dsl) ([]byte, error) {
-		return []byte(fmt.Sprintf(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"hits":[{"_id":%q,"_source":{"v":1,"t":2000,"n":[],"s":[]}}]}}`, m.metricID(q, writeRateKey, 2000))), nil
+		return []byte(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`), nil
 	}}
-	if _, err := readMetricScoreBuckets(ctx, &s, q, m, writeRateKey, []int64{2000, 3000}); !errors.Is(err, errSummaryHistory) {
+	if _, err := readMetricScoreBuckets(ctx, &s, q, m, writeRateKey, []int64{2000, 3000}, proof); !errors.Is(err, errSummaryMissing) {
 		t.Fatal(err)
 	}
 }
@@ -69,6 +69,8 @@ func TestMaterializedFailedSearchDoesNotPublish(t *testing.T) {
 		case method == http.MethodDelete:
 			closes++
 			return []byte(`{"pits":[{"pit_id":"p","successful":true}]}`), nil
+		case method == http.MethodGet:
+			return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
 		case method == http.MethodPut:
 			writes++
 			return nil, nil

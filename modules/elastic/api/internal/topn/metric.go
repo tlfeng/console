@@ -23,6 +23,7 @@ func (m metricMode) difference() bool {
 }
 
 type Metric struct {
+	rawProof                     *string
 	Item                         *common.MetricItem
 	Field, Field2, Units, Format string
 	mode                         metricMode

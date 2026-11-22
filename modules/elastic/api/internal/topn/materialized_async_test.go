@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"reflect"
 	"testing"
 	"time"
 
@@ -25,7 +24,7 @@ func TestOnDemandConfig(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	m, err := c.store("raw")
-	if err != nil || m.index != ".console-topn-index-rate-v1" {
+	if err != nil || m.index != ".console-topn-index-rate-v2" {
 		t.Fatalf("%+v %v", m, err)
 	}
 }
@@ -71,27 +70,19 @@ func TestOnDemandQueue(t *testing.T) {
 	}
 }
 
-func TestSummaryStoreInitDoesNotOverwrite(t *testing.T) {
-	m := materializedStore{index: ".console-topn-test"}
-	var methods []string
+func TestSummaryWithoutRawPolicyDoesNotCreateIndex(t *testing.T) {
+	m := materializedStore{index: ".console-topn-test", raw: "raw"}
 	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
-		methods = append(methods, method)
-		if len(methods) == 1 {
+		if method != http.MethodGet {
+			t.Fatalf("unexpected mutation: %s %s", method, path)
+		}
+		if path == "/"+m.index+"/_mapping" {
 			return nil, monitoringHTTPError(404)
 		}
-		if method == http.MethodPut {
-			return nil, monitoringHTTPError(400)
-		}
-		return []byte(`{".console-topn-test":{"mappings":{"_meta":{"console_topn":1}}}}`), nil
+		return []byte(`{"raw":{"settings":{"index.uuid":"original"}}}`), nil
 	}
-	if err := ensureSummaryIndex(context.Background(), call, m); err != nil {
+	if err := ensureSummaryIndex(context.Background(), call, m, pitAPI{}); !errors.Is(err, errSummaryNoPolicy) {
 		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(methods, []string{"GET", "PUT", "GET"}) {
-		t.Fatal(methods)
-	}
-	if err := ensureSummaryIndex(context.Background(), call, m); err != nil || len(methods) != 4 {
-		t.Fatal(methods, err)
 	}
 }
 
@@ -100,6 +91,9 @@ func TestOnDemandEmptyDoesNotPublish(t *testing.T) {
 	m := materializedStore{raw: "raw", index: ".console-topn-test"}
 	calls := 0
 	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
+		if method == http.MethodGet {
+			return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
+		}
 		if method == http.MethodPut {
 			t.Fatal("empty bucket must not be persisted")
 		}
@@ -110,13 +104,10 @@ func TestOnDemandEmptyDoesNotPublish(t *testing.T) {
 			return []byte(`{"pit_id":"p","_shards":{"total":1,"successful":1,"failed":0}}`), nil
 		}
 		calls++
-		if calls == 1 {
-			return []byte(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"hits":[]}}`), nil
-		}
 		return []byte(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"aggregations":{"entities":{"buckets":[]}}}`), nil
 	}
 	metric := materializedMetric(writeRateKey)
-	if err := computeMissingSummaries(context.Background(), call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, metric, time.Unix(2000, 0), true); err != nil || len(metric.Item.Lines) != 0 || calls != 2 {
+	if err := computeMissingSummaries(context.Background(), call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, metric, time.Unix(2000, 0), true); err != nil || len(metric.Item.Lines) != 0 || calls != 1 {
 		t.Fatal(err, calls)
 	}
 }

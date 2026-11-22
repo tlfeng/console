@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -331,6 +332,197 @@ func TestEasysearchSnapshot(t *testing.T) {
 					t.Fatalf("seconds=%d PIT=%v: sparse data must not produce a fake difference", tc.seconds, usePIT)
 				}
 			}
+		}
+	})
+
+	t.Run("reads and deduplicates summary rollover generations", func(t *testing.T) {
+		alias := ".console-topn-" + index + "-rollover"
+		raw := index
+		m := materializedStore{raw: raw, index: alias}
+		t.Cleanup(func() {
+			for _, name := range []string{alias + "-000001", alias + "-000002"} {
+				_, _ = call(context.Background(), "DELETE", "/"+name, nil)
+			}
+			_, _ = call(context.Background(), "DELETE", "/_index_template/"+alias+"-rollover", nil)
+		})
+		api := pitFor(elastic.Version{Distribution: elastic.Easysearch})
+		mapping := dsl{"dynamic": false, "_meta": dsl{"console_topn": materializedVersion}}
+		must("PUT", "/_index_template/"+alias+"-rollover", dsl{"index_patterns": []string{alias + "-*"}, "priority": 1000, "template": dsl{"mappings": mapping}})
+		must("PUT", "/"+alias+"-000001", dsl{"mappings": mapping, "aliases": dsl{alias: dsl{"is_write_index": true}}})
+		q := Query{Cluster: "biz", Width: 1}
+		proof := rawBucketProof{1000: {"one": 1}, 2000: {"one": 1}}
+		digest := proof.transition(2000, 1000)
+		id := m.provenID(q, writeRateKey, 2000, digest)
+		score := dsl{"v": materializedVersion, "t": 2000, "n": []string{"a"}, "s": []float64{3}, "p": digest}
+		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
+		must("POST", "/"+alias+"/_rollover", dsl{})
+		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
+		if err := checkMaterializedIndex(ctx, call, m); err != nil {
+			t.Fatal(err)
+		}
+		snap, err := open(ctx, call, alias, api)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer snap.close()
+		rows, err := readMetricScoreBuckets(ctx, snap, q, m, writeRateKey, []int64{2000}, proof)
+		if err != nil || len(rows) != 1 || rows[0].Scores[0] != 3 {
+			t.Fatalf("%v %v", rows, err)
+		}
+	})
+
+	t.Run("materialized scores follow raw backing expiry", func(t *testing.T) {
+		old, recent, tail := index+"-expiry-old", index+"-expiry-recent", index+"-expiry-tail"
+		alias, summary := index+"-expiry-raw", ".console-topn-"+index+"-expiry-summary"
+		for _, name := range []string{old, recent, tail} {
+			must("PUT", "/"+name, dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "aliases": dsl{alias: dsl{}}, "mappings": dsl{"properties": dsl{"timestamp": dsl{"type": "date"}, "metadata": dsl{"properties": dsl{"name": dsl{"type": "keyword"}, "category": dsl{"type": "keyword"}, "labels": dsl{"properties": dsl{"cluster_id": dsl{"type": "keyword"}, "index_name": dsl{"type": "keyword"}, "index_uuid": dsl{"type": "keyword"}}}}}}}})
+		}
+		t.Cleanup(func() {
+			_, _ = call(context.Background(), "DELETE", "/"+tail, nil)
+			_, _ = call(context.Background(), "DELETE", "/"+recent, nil)
+			_, _ = call(context.Background(), "DELETE", "/"+old, nil)
+		})
+		must("PUT", "/"+summary, dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "mappings": dsl{"dynamic": false, "_meta": dsl{"console_topn": materializedVersion}}})
+		t.Cleanup(func() { _, _ = call(context.Background(), "DELETE", "/"+summary, nil) })
+		for i, r := range []struct {
+			target          string
+			offset, counter int
+		}{{old, 1, 10}, {recent, 2, 5}, {recent, 1001, 20}, {recent, 2001, 25}, {tail, 3001, 27}} {
+			must("PUT", fmt.Sprintf("/%s/_doc/%d?refresh=true", r.target, i), dsl{"timestamp": epoch + r.offset, "metric": r.counter, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "expiry", "index_name": "a", "index_uuid": "a-uuid"}}})
+		}
+		m := materializedStore{index: summary, raw: alias}
+		q := Query{Cluster: "expiry", Source: "index_stats", Min: epoch + 1000, Max: epoch + 3999, Width: 1, N: 1, AllIndices: true}
+		starts := []int64{epoch + 1000, epoch + 2000, epoch + 3000}
+		api := pitFor(elastic.Version{Distribution: elastic.Easysearch})
+		makeMetric := func() Metric { metric := materializedMetric(writeRateKey); metric.Field = "metric"; return metric }
+		now := time.UnixMilli(epoch + 86400000)
+		if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeMetric(), starts}}); err != nil {
+			t.Fatal(err)
+		}
+		must("POST", "/"+summary+"/_refresh", nil)
+		before := makeMetric()
+		if err := readMaterialized(ctx, call, api, m, q, before, now); err != nil {
+			t.Fatal(err)
+		}
+		if got := before.Item.Lines[0].Data; !reflect.DeepEqual(got, [][]interface{}{{int64(epoch + 1000), 10.0}, {int64(epoch + 2000), 5.0}, {int64(epoch + 3000), 2.0}}) {
+			t.Fatal(got)
+		}
+		original, err := openRawSummary(ctx, call, alias, api)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := rawSummaryProof(ctx, original, q, starts)
+		original.close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := proof.digest()
+		before.rawProof = &digest
+		key := summaryJobKey(m, q, before)
+		done := make(chan struct{})
+		close(done)
+		onDemandSummaries.mu.Lock()
+		onDemandSummaries.jobs[key] = &summaryJob{done: done, expires: time.Now().Add(time.Minute), metric: before}
+		onDemandSummaries.mu.Unlock()
+		t.Cleanup(func() {
+			onDemandSummaries.mu.Lock()
+			delete(onDemandSummaries.jobs, key)
+			onDemandSummaries.mu.Unlock()
+		})
+		if found, err := lookupRetainedJob(ctx, call, api, m, q, makeMetric(), now, key); !found || err != nil {
+			t.Fatalf("valid cached result: %v %v", found, err)
+		}
+		t.Run("clipped job proof ignores observations outside the window", func(t *testing.T) {
+			clipped := q
+			clipped.Max = epoch + 3500
+			cached := makeMetric()
+			cached.rawProof = new(string)
+			if err := computeMissingSummaries(ctx, call, api, m, clipped, cached, now, false); err != nil {
+				t.Fatal(err)
+			}
+			key := summaryJobKey(m, clipped, cached)
+			onDemandSummaries.mu.Lock()
+			onDemandSummaries.jobs[key] = &summaryJob{done: done, expires: time.Now().Add(time.Minute), metric: cached}
+			onDemandSummaries.mu.Unlock()
+			t.Cleanup(func() {
+				onDemandSummaries.mu.Lock()
+				delete(onDemandSummaries.jobs, key)
+				onDemandSummaries.mu.Unlock()
+			})
+			addTail := func(id string, offset int) {
+				must("PUT", "/"+tail+"/_doc/"+id+"?refresh=true", dsl{"timestamp": epoch + offset, "metric": 30, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "expiry", "index_name": "a", "index_uuid": "a-uuid"}}})
+			}
+			addTail("outside", 3800)
+			got := makeMetric()
+			found, err := lookupRetainedJob(ctx, call, api, m, clipped, got, now, key)
+			if !found || err != nil || !reflect.DeepEqual(got.Item.Lines, cached.Item.Lines) {
+				t.Fatalf("outside-window sample invalidated result: %v %v", found, err)
+			}
+			addTail("inside", 3400)
+			got = makeMetric()
+			if found, err := lookupRetainedJob(ctx, call, api, m, clipped, got, now, key); found || err != nil || len(got.Item.Lines) != 0 {
+				t.Fatalf("inside-window sample did not invalidate: %v %v", found, err)
+			}
+			must("DELETE", "/"+tail+"/_doc/inside?refresh=true", nil)
+			must("DELETE", "/"+tail+"/_doc/outside?refresh=true", nil)
+		})
+		t.Run("verified empty transition is readable", func(t *testing.T) {
+			makeEmpty := func() Metric {
+				metric := materializedMetric(queryLatencyKey)
+				metric.Field = "metric"
+				metric.Field2 = "absent_counter"
+				return metric
+			}
+			if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeEmpty(), starts}}); err != nil {
+				t.Fatal(err)
+			}
+			must("POST", "/"+summary+"/_refresh", nil)
+			metric := makeEmpty()
+			if err := readMaterialized(ctx, call, api, m, q, metric, now); err != nil || len(metric.Item.Lines) != 0 {
+				t.Fatalf("proved empty result: %v %v", err, metric.Item.Lines)
+			}
+		})
+		must("DELETE", "/"+old, nil)
+		cached := makeMetric()
+		if found, err := lookupRetainedJob(ctx, call, api, m, q, cached, now, key); found || err != nil || len(cached.Item.Lines) != 0 {
+			t.Fatalf("expired cached result: %v %v %v", found, err, cached.Item.Lines)
+		}
+		if err := readMaterialized(ctx, call, api, m, q, makeMetric(), now); !errors.Is(err, errSummaryMissing) {
+			t.Fatalf("partly expired predecessor reused: %v", err)
+		}
+		stale := newScoreBucket(starts[0])
+		stale.Names = []string{"a"}
+		stale.Scores = []float64{10}
+		denyWrite := func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
+			if strings.Contains(path, "/_create/") {
+				t.Fatal("stale snapshot must not be published")
+			}
+			return call(ctx, method, path, body)
+		}
+		if err := publishProvenBuckets(ctx, denyWrite, api, m, q, [][]scoreBucket{{stale}}, []transitionBatch{{makeMetric(), starts[:1]}}, proof); err != nil {
+			t.Fatal(err)
+		}
+		after := makeMetric()
+		if err := computeMissingSummaries(ctx, call, api, m, q, after, now, true); err != nil {
+			t.Fatal(err)
+		}
+		if got := after.Item.Lines[0].Data; !reflect.DeepEqual(got, [][]interface{}{{int64(epoch + 1000), 15.0}, {int64(epoch + 2000), 5.0}, {int64(epoch + 3000), 2.0}}) {
+			t.Fatal(got)
+		}
+		must("DELETE", "/"+recent, nil)
+		expired := makeMetric()
+		if err := readMaterialized(ctx, call, api, m, q, expired, now); err != nil || len(expired.Item.Lines) != 0 {
+			t.Fatalf("expired points must not rank: %v %v", err, expired.Item.Lines)
+		}
+		writes := 0
+		tracked := func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
+			if strings.Contains(path, "/_create/") {
+				writes++
+			}
+			return call(ctx, method, path, body)
+		}
+		if err := computeMissingSummaries(ctx, tracked, api, m, q, makeMetric(), now, true); err != nil || writes != 0 {
+			t.Fatalf("expired buckets must not be written: %v writes=%d", err, writes)
 		}
 	})
 

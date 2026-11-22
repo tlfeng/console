@@ -58,6 +58,7 @@ export default (props) => {
   
     const firstFetchRef = useRef(true)
     const activeRequestRef = useRef()
+    const fetchDataRef = useRef()
     const pendingRequestRef = useRef()
 
     const [timeInterval, setTimeInterval] = useState()
@@ -79,6 +80,7 @@ export default (props) => {
         activeRequestRef.current?.abort();
         controller = new AbortController();
         activeRequestRef.current = controller;
+        pendingRequestRef.current = { key: chartQuery, controller };
       }
       if (firstFetchRef.current || showLoading) {
         setLoading(true)
@@ -93,40 +95,48 @@ export default (props) => {
         newQueryParams.bucket_size = timeInterval
       }
       if (advancedTopN) newQueryParams.topn_async = true
-      const started = Date.now()
+      let timedOut = false
+      const deadline = controller && setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, 90000)
       let res
-      do {
-        res = await request(fetchUrl, {
-          method: 'GET',
-          queryParams: newQueryParams,
-          ignoreTimeout: true,
-          ...(controller ? { signal: controller.signal, expirys: false } : {})
-        }, false, false)
-        if (!controller || controller.signal.aborted || res?.topn_status !== 'pending') break
-        pendingRequestRef.current = { key: chartQuery, controller }
-        setMetric(undefined)
-        setLoading(true)
-        setError(formatMessage({ id: 'cluster.metrics.topn.pending' }))
-        if (Date.now() - started >= 90000) {
-          res = { topn_status: 'timed_out' }
-          break
-        }
-        await new Promise((resolve) => {
-          const finish = () => {
-            clearTimeout(timer)
-            controller.signal.removeEventListener('abort', finish)
-            resolve()
-          }
-          const timer = setTimeout(finish, 2000)
-          controller.signal.addEventListener('abort', finish, { once: true })
-        })
-      } while (!controller.signal.aborted)
-      if (pendingRequestRef.current?.controller === controller) pendingRequestRef.current = undefined;
-      if (controller?.signal.aborted) return;
+      try {
+        do {
+          res = await request(fetchUrl, {
+            method: 'GET',
+            queryParams: newQueryParams,
+            ignoreTimeout: true,
+            ...(controller ? { signal: controller.signal, expirys: false } : {})
+          }, false, false)
+          if (!controller || controller.signal.aborted || !['pending', 'busy'].includes(res?.topn_status)) break
+          setMetric(undefined)
+          setLoading(true)
+          setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }))
+          await new Promise((resolve) => {
+            const finish = () => {
+              clearTimeout(timer)
+              controller.signal.removeEventListener('abort', finish)
+              resolve()
+            }
+            const timer = setTimeout(finish, 2000)
+            controller.signal.addEventListener('abort', finish, { once: true })
+          })
+        } while (!controller.signal.aborted)
+      } catch {
+        res = undefined
+      } finally {
+        clearTimeout(deadline)
+        if (pendingRequestRef.current?.controller === controller) pendingRequestRef.current = undefined;
+      }
+      if (controller?.signal.aborted) {
+        if (!timedOut || activeRequestRef.current !== controller || !observerRef.current.isInView) return;
+        res = { topn_status: 'timed_out' }
+      }
       if (advancedTopN && res?.topn_status) {
         setMetric(undefined);
         setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }));
-      } else if (advancedTopN && (!res || res instanceof Error)) {
+      } else if (advancedTopN && !res?.error && (!res?.metrics || typeof res.metrics !== "object" || Array.isArray(res.metrics))) {
         setMetric(undefined);
         setError(formatMessage({ id: "cluster.metrics.topn.query_failed" }));
       } else if (res?.error) {
@@ -142,6 +152,8 @@ export default (props) => {
         firstFetchRef.current = false
       }
     }
+
+    useEffect(() => { fetchDataRef.current = fetchData; });
 
     const fixFormat = (formatType, format) => {
       return formatType === 'num' && format ? `${format}a` : format
@@ -165,7 +177,7 @@ export default (props) => {
               observerRef.current.isInView = true
               if (JSON.stringify(observerRef.current.deps) !== JSON.stringify(observerRef.current.lastDeps)) {
                 observerRef.current.lastDeps = cloneDeep(observerRef.current.deps)
-                fetchData(...observerRef.current.deps)
+                fetchDataRef.current?.(...observerRef.current.deps)
               }
             } else {
               observerRef.current.isInView = false

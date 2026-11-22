@@ -68,7 +68,7 @@ func (c materializedConfig) enabled(cluster, key string) bool {
 
 func (c materializedConfig) store(raw string) (materializedStore, error) {
 	if c.Enabled && c.Index == "" {
-		c.Index = ".console-topn-index-rate-v1"
+		c.Index = ".console-topn-index-rate-v2"
 	}
 	// Explicit concrete index outside the original monitoring and rollup namespace.
 	if !rawName.MatchString(c.Index) || !strings.HasPrefix(c.Index, ".console-topn-") || c.Index == raw {
@@ -126,10 +126,15 @@ type scoreBucket struct {
 	Start   int64     `json:"t"`
 	Names   []string  `json:"n"`
 	Scores  []float64 `json:"s"`
+	Proof   string    `json:"p,omitempty"`
 }
 
 func (m materializedStore) metricID(q Query, key string, start int64) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%d\x00%d", materializedVersion, m.raw, q.Cluster, key, q.Width, start))))
+}
+
+func (m materializedStore) provenID(q Query, key string, start int64, proof string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(m.metricID(q, key, start)+":"+proof)))
 }
 
 func (b scoreBucket) valid(start int64) bool {
@@ -160,18 +165,25 @@ func materializedScopes(q Query, seal int64) ([]int64, map[int64]bool) {
 	return sealed, edges
 }
 
-func readMetricScoreBuckets(ctx context.Context, s *snapshot, q Query, m materializedStore, key string, starts []int64) ([]scoreBucket, error) {
+func readMetricScoreBuckets(ctx context.Context, s *snapshot, q Query, m materializedStore, key string, starts []int64, proof rawBucketProof) ([]scoreBucket, error) {
 	if len(starts) == 0 {
 		return nil, nil
 	}
 	ids := make([]string, 0, len(starts))
 	want := make(map[string]int64, len(starts))
 	for _, ts := range starts {
-		id := m.metricID(q, key, ts)
+		digest := proof.transition(ts, int64(q.Width)*1000)
+		if digest == "" {
+			continue
+		}
+		id := m.provenID(q, key, ts, digest)
 		ids = append(ids, id)
 		want[id] = ts
 	}
-	body := dsl{"size": len(ids), "track_total_hits": false, "query": dsl{"ids": dsl{"values": ids}}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	body := dsl{"size": len(ids) * s.shards, "track_total_hits": true, "query": dsl{"ids": dsl{"values": ids}}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
 	if err := searchTimeout(ctx, body); err != nil {
 		return nil, err
 	}
@@ -182,6 +194,10 @@ func readMetricScoreBuckets(ctx context.Context, s *snapshot, q Query, m materia
 	var response struct {
 		searchResponse
 		Hits struct {
+			Total struct {
+				Value    int    `json:"value"`
+				Relation string `json:"relation"`
+			} `json:"total"`
 			Rows []struct {
 				ID     string      `json:"_id"`
 				Source scoreBucket `json:"_source"`
@@ -197,15 +213,23 @@ func readMetricScoreBuckets(ctx context.Context, s *snapshot, q Query, m materia
 	if response.TimedOut != nil && *response.TimedOut {
 		return nil, context.DeadlineExceeded
 	}
-	if !response.complete() || response.Shards.Total != s.shards || response.Origin != "" || response.Hits.Rows == nil {
+	if !response.complete() || response.Shards.Total != s.shards || response.Origin != "" || response.Hits.Rows == nil || response.Hits.Total.Relation != "eq" || response.Hits.Total.Value != len(response.Hits.Rows) {
 		return nil, errors.New("incomplete TopN summary search")
 	}
 	out := make([]scoreBucket, 0, len(ids))
+	seen := make(map[string]scoreBucket)
 	for _, row := range response.Hits.Rows {
 		ts, ok := want[row.ID]
-		if !ok || !row.Source.valid(ts) {
+		if previous, duplicate := seen[row.ID]; duplicate {
+			if previous.Proof != row.Source.Proof || previous.Start != row.Source.Start || previous.Version != row.Source.Version || !slices.Equal(previous.Names, row.Source.Names) || !slices.Equal(previous.Scores, row.Source.Scores) {
+				return nil, errors.New("conflicting TopN summary generations")
+			}
+			continue
+		}
+		if !ok || !row.Source.valid(ts) || row.Source.Proof != proof.transition(ts, int64(q.Width)*1000) {
 			return nil, errors.New("invalid TopN summary document")
 		}
+		seen[row.ID] = row.Source
 		delete(want, row.ID)
 		out = append(out, row.Source)
 	}

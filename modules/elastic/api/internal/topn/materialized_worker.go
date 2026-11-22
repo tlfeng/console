@@ -46,14 +46,9 @@ func readTransitionBatches(ctx context.Context, s *snapshot, q Query, batches []
 				return nil, errors.New("invalid TopN transition range")
 			}
 			for _, start := range []int64{ts - w, ts} {
-				if start < 0 {
-					continue
+				if lo, hi, ok := transitionBounds(q, start); ok {
+					ranges[start] = filterRange(lo, hi)
 				}
-				lo, hi := start, min(q.Max, start+w-1)
-				if start >= first {
-					lo = max(q.Min, lo)
-				}
-				ranges[start] = filterRange(lo, hi)
 			}
 		}
 	}
@@ -124,16 +119,20 @@ func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializ
 		return errBudget
 	}
 	call = budgetedCaller(call, responseLimit)
-	all, err := loadSummaries(ctx, call, api, m, q, metric, sealed)
+	s, err := openRawSummary(ctx, call, m.raw, api)
+	if err != nil {
+		return err
+	}
+	defer s.close()
+	proof, err := rawSummaryProof(ctx, s, q, sealed)
+	if err != nil {
+		return err
+	}
+	all, err := loadSummaries(ctx, call, api, m, q, metric, sealed, proof)
 	if err != nil {
 		return err
 	}
 	if len(edges) > 0 {
-		s, err := open(ctx, call, m.raw, api)
-		if err != nil {
-			return err
-		}
-		defer s.close()
 		scores, err := readTransitions(ctx, s, q, metric, edges)
 		if err != nil {
 			return err
@@ -149,23 +148,6 @@ func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializ
 
 // Only an administrator-provisioned concrete index with this mapping marker
 // may be written by the worker. In particular, an alias is not a target.
-func checkMaterializedIndex(ctx context.Context, call caller, m materializedStore) error {
-	raw, err := call(ctx, http.MethodGet, "/"+m.index+"/_mapping", nil)
-	if err != nil {
-		return err
-	}
-	var mapping map[string]struct {
-		Mappings struct {
-			Meta struct {
-				Version int `json:"console_topn"`
-			} `json:"_meta"`
-		}
-	}
-	if err = json.Unmarshal(raw, &mapping); err != nil || len(mapping) != 1 || mapping[m.index].Mappings.Meta.Version != materializedVersion {
-		return errors.New("unexpected TopN summary index mapping")
-	}
-	return nil
-}
 
 func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, batches []transitionBatch) error {
 	w := int64(q.Width) * 1000
@@ -179,57 +161,87 @@ func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m ma
 			}
 		}
 	}
-	s, err := open(ctx, budgetedCaller(call, responseLimit), m.raw, api)
+	s, err := openRawSummary(ctx, budgetedCaller(call, responseLimit), m.raw, api)
 	if err != nil {
 		return err
 	}
 	defer s.close()
+	var starts []int64
+	for _, batch := range batches {
+		starts = append(starts, batch.starts...)
+	}
+	proof, err := rawSummaryProof(ctx, s, q, starts)
+	if err != nil {
+		return err
+	}
 	sets, err := readTransitionBatches(ctx, s, q, batches)
 	if err != nil {
 		return err
 	}
-	for i, set := range sets {
-		for _, bucket := range set {
-			path := "/" + m.index + "/_create/" + m.metricID(q, batches[i].metric.Item.Key, bucket.Start)
-			body := dsl{"v": bucket.Version, "t": bucket.Start, "n": bucket.Names, "s": bucket.Scores}
-			if _, err = call(ctx, http.MethodPut, path, body); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return publishProvenBuckets(ctx, call, api, m, q, sets, batches, proof)
 }
 
-func missingMaterialized(ctx context.Context, call caller, m materializedStore, q Query, keys []string, starts []int64) (map[string][]int64, error) {
+func missingMaterialized(ctx context.Context, call caller, m materializedStore, q Query, keys []string, starts []int64, proof rawBucketProof) (map[string][]int64, error) {
+	eligible := make([]int64, 0, len(starts))
+	for _, st := range starts {
+		if proof.transition(st, int64(q.Width)*1000) != "" {
+			eligible = append(eligible, st)
+		}
+	}
+	starts = eligible
+	if len(starts) == 0 {
+		return nil, nil
+	}
 	ids := make([]string, 0, len(starts)*len(keys))
 	for _, key := range keys {
 		for _, st := range starts {
-			ids = append(ids, m.metricID(q, key, st))
+			ids = append(ids, m.provenID(q, key, st, proof.transition(st, int64(q.Width)*1000)))
 		}
 	}
-	raw, err := call(ctx, http.MethodPost, "/"+m.index+"/_mget?_source=false", dsl{"ids": ids})
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Docs []struct {
-			ID    string `json:"_id"`
-			Found *bool  `json:"found"`
+	found := make(map[string]bool, len(ids))
+	for offset := 0; offset < len(ids); offset += 128 {
+		chunk := ids[offset:min(len(ids), offset+128)]
+		body := dsl{"size": len(chunk) * 32, "track_total_hits": true, "_source": false, "query": dsl{"ids": dsl{"values": chunk}}}
+		if err := searchTimeout(ctx, body); err != nil {
+			return nil, err
 		}
-	}
-	if err = json.Unmarshal(raw, &result); err != nil || len(result.Docs) != len(ids) {
-		return nil, errors.New("incomplete TopN summary coverage lookup")
+		raw, err := call(ctx, http.MethodPost, "/"+m.index+"/_search?allow_partial_search_results=false", body)
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			searchResponse
+			Hits struct {
+				Total struct {
+					Value    int    `json:"value"`
+					Relation string `json:"relation"`
+				} `json:"total"`
+				Rows []struct {
+					ID string `json:"_id"`
+				} `json:"hits"`
+			} `json:"hits"`
+		}
+		if err = json.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		if !result.complete() || result.Origin != "" || result.Hits.Rows == nil || result.Hits.Total.Relation != "eq" || result.Hits.Total.Value != len(result.Hits.Rows) {
+			return nil, errors.New("incomplete TopN summary coverage lookup")
+		}
+		for _, row := range result.Hits.Rows {
+			if !slices.Contains(chunk, row.ID) {
+				return nil, errors.New("invalid TopN summary coverage lookup")
+			}
+			found[row.ID] = true
+		}
 	}
 	missing := make(map[string][]int64)
-	for i, d := range result.Docs {
-		if d.Found == nil || d.ID != ids[i] {
-			return nil, errors.New("invalid TopN summary coverage lookup")
-		}
-		if !*d.Found {
+	for i, id := range ids {
+		if !found[id] {
 			key := keys[i/len(starts)]
 			missing[key] = append(missing[key], starts[i%len(starts)])
 		}
 	}
+
 	return missing, nil
 }
 
@@ -257,7 +269,16 @@ func materializedTick(ctx context.Context, call caller, api pitAPI, m materializ
 			if len(starts) == 0 {
 				continue
 			}
-			missing, err := missingMaterialized(ctx, call, m, q, keys, starts)
+			rawSnapshot, err := openRawSummary(ctx, call, m.raw, api)
+			if err != nil {
+				return err
+			}
+			proof, err := rawSummaryProof(ctx, rawSnapshot, q, starts)
+			rawSnapshot.close()
+			if err != nil {
+				return err
+			}
+			missing, err := missingMaterialized(ctx, call, m, q, keys, starts, proof)
 			if err != nil {
 				return err
 			}
@@ -314,16 +335,16 @@ func StartMaterialized() {
 				call, version, _ := monitoredStore()
 				if call == nil {
 					err = errUnavailable
-				} else if cfg.TopN.Materialized.Enabled {
-					if pitFor(version).path != "" {
-						err = ensureSummaryIndex(ctx, budgetedCaller(call, responseLimit), m)
+				} else if api := pitFor(version); api.path != "" {
+					if cfg.TopN.Materialized.Enabled {
+						err = ensureSummaryIndex(ctx, budgetedCaller(call, responseLimit), m, api)
+					} else {
+						err = materializedTick(ctx, call, api, m, cfg.TopN.Materialized.Clusters, cfg.TopN.Materialized.metricKeys(), time.Now().UTC())
 					}
-				} else {
-					err = materializedTick(ctx, call, pitFor(version), m, cfg.TopN.Materialized.Clusters, cfg.TopN.Materialized.metricKeys(), time.Now().UTC())
 				}
 			}
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errSummaryNoPolicy) {
 			log.Warnf("materialize monitoring TopN: %v", err)
 		}
 	}})
