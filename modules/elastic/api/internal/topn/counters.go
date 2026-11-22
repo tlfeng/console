@@ -7,7 +7,7 @@ import (
 
 const (
 	pageSize  = 64
-	maxPages  = 24
+	maxPages  = 48
 	maxPoints = 150000
 )
 
