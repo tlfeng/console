@@ -682,6 +682,9 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		}
 	}
 
+	if metrics == nil {
+		metrics = map[string]*common.MetricItem{}
+	}
 	resBody["metrics"] = metrics
 	ver := elastic.GetClient(global.MustLookupString(elastic.GlobalSystemElasticsearchID)).GetVersion()
 	if ver.Distribution == "" {

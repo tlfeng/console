@@ -32,9 +32,11 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	}
 	// The target is a concrete index or alias. ES 6.8 does not support hidden wildcard expansion.
 	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false"
-	raw, err := call(ctx, http.MethodPost, path, dsl{
-		"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": aggs,
-	})
+	request := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": aggs}
+	if err := searchTimeout(ctx, request); err != nil {
+		return err
+	}
+	raw, err := call(ctx, http.MethodPost, path, request)
 	if err != nil {
 		return err
 	}
@@ -47,6 +49,9 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	}
 	if response.Origin != "" {
 		return errRawHistory
+	}
+	if response.TimedOut != nil && *response.TimedOut {
+		return context.DeadlineExceeded
 	}
 	if !response.complete() {
 		return errors.New("incomplete monitoring search")

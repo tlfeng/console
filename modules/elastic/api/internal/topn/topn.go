@@ -193,14 +193,11 @@ func monitoredStore() (caller, elastic.Version, string) {
 		if err != nil {
 			return nil, err
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		if res == nil {
 			return nil, errors.New("missing monitoring response")
 		}
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
-			return nil, fmt.Errorf("monitoring store returned HTTP %d", res.StatusCode)
+			return res.Body, fmt.Errorf("monitoring store returned HTTP %d", res.StatusCode)
 		}
 		return res.Body, nil
 	}, client.GetVersion(), id + "\x00" + base
@@ -251,7 +248,7 @@ type snapshot struct {
 func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot, error) {
 	path := "/" + index + api.path + "?keep_alive=30s&" + api.strictParam + "=false&allow_no_indices=false&ignore_unavailable=false&expand_wildcards=open,hidden"
 	raw, err := call(ctx, http.MethodPost, path, nil)
-	if err != nil {
+	if err != nil && len(raw) == 0 {
 		return nil, err
 	}
 	var response struct {
@@ -259,15 +256,18 @@ func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot
 		PITID  string      `json:"pit_id"`
 		Shards shardCounts `json:"_shards"`
 	}
-	err = json.Unmarshal(raw, &response)
+	decodeErr := json.Unmarshal(raw, &response)
 	id := response.PITID
 	if api.idField == "id" {
 		id = response.ID
 	}
 	s := &snapshot{call: call, api: api, id: id, shards: response.Shards.Total}
-	if err != nil || s.id == "" || !response.Shards.complete() {
+	if err != nil || decodeErr != nil || s.id == "" || !response.Shards.complete() {
 		if s.id != "" {
 			s.close()
+		}
+		if err != nil {
+			return nil, err
 		}
 		return nil, errors.New("incomplete monitoring snapshot")
 	}
@@ -285,9 +285,37 @@ func (s *snapshot) close() {
 	if s.api.idField == "id" {
 		body = dsl{"id": s.id}
 	}
-	if _, err := s.call(ctx, http.MethodDelete, s.api.path, body); err != nil {
+	raw, err := s.call(ctx, http.MethodDelete, s.api.path, body)
+	if err == nil {
+		err = checkPITClose(raw, s.id, s.api.idField == "id")
+	}
+	if err != nil {
 		log.Warnf("close monitoring TopN snapshot: %v", err)
 	}
+}
+
+func checkPITClose(raw []byte, id string, scalarID bool) error {
+	var response struct {
+		Succeeded bool `json:"succeeded"`
+		PITs      []struct {
+			ID         string `json:"pit_id"`
+			Successful bool   `json:"successful"`
+		} `json:"pits"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if scalarID && response.Succeeded {
+		return nil
+	}
+	if !scalarID {
+		for _, pit := range response.PITs {
+			if pit.ID == id && pit.Successful {
+				return nil
+			}
+		}
+	}
+	return errors.New("monitoring store did not acknowledge PIT deletion")
 }
 
 type bucket struct {
@@ -315,8 +343,11 @@ func (r searchResponse) complete() bool {
 
 func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
 	body := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": dsl{"entities": agg}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
+	if err := searchTimeout(ctx, body); err != nil {
+		return err
+	}
 	raw, err := s.call(ctx, http.MethodPost, "/_search?allow_partial_search_results=false", body)
-	if err != nil {
+	if err != nil && len(raw) == 0 {
 		return err
 	}
 	if len(raw) > (16<<20)-s.bytes {
@@ -329,7 +360,13 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if response.ID != "" {
 		s.id = response.ID
 	}
+	if err != nil {
+		return err
+	}
 	s.bytes += len(raw)
+	if response.TimedOut != nil && *response.TimedOut {
+		return context.DeadlineExceeded
+	}
 	if !response.complete() || response.Shards.Total != s.shards {
 		return errors.New("incomplete monitoring search")
 	}
@@ -432,7 +469,17 @@ var errUnavailable = errors.New("automatic TopN unavailable")
 // Serve owns the response for supported Advanced automatic charts. A failed
 // calculation must not be presented as a successful legacy activity ranking.
 func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
-	err := calculate(r.Context(), q, metric)
+	timeout, err := queryTimeout(r.URL.Query().Get("timeout"))
+	if err != nil {
+		WriteStatus(w, "invalid_request")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	err = calculate(ctx, q, metric)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if r.Context().Err() != nil {
 		return
 	}
@@ -505,8 +552,6 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	default:
 		return errBudget
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	q.setSearchVersion(version)
 	q.storeScope = scope
 	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
@@ -534,6 +579,7 @@ func hasMissingJVMStarts(raw json.RawMessage) (bool, error) {
 }
 
 func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+	call = budgetedCaller(call, responseLimit)
 	nodeDifference := q.Source == "node_stats" && metric.mode.difference()
 	single := func() error {
 		m := metric
@@ -552,7 +598,7 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
 	if singleFirst {
 		singleErr = single()
-		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
+		if singleErr == nil || errors.Is(singleErr, errRawHistory) || errors.Is(singleErr, errResponseBudget) || api.path == "" || ctx.Err() != nil {
 			return singleErr
 		}
 	}

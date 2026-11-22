@@ -1,6 +1,7 @@
 package topn
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -42,8 +43,6 @@ func TestScoreSeries(t *testing.T) {
 		score   float64
 	}{
 		{"peak gap", Metric{}, []samples{mk(1000, val(0), nil), mk(3000, val(4), nil)}, [][]interface{}{{int64(1000), 0.0}, {int64(2000), nil}, {int64(3000), 4.0}}, 4},
-		{"disk available", Metric{mode: ratio, reverseRatio: true}, []samples{mk(1000, val(100), val(0)), mk(2000, val(0), val(1)), mk(3000, val(100), nil), mk(4000, val(200), val(100))}, [][]interface{}{{int64(1000), 0.0}, {int64(2000), nil}, {int64(4000), 50.0}}, 50},
-		{"ratio missing", Metric{mode: ratio}, []samples{mk(1000, nil, val(200)), mk(4000, val(1), val(0))}, nil, -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			row, err := scoreSeries(q, tc.metric, "entity", tc.samples)
@@ -61,5 +60,30 @@ func TestScoreSeries(t *testing.T) {
 	row, err := scoreSeries(q, Metric{mode: storageGrowth}, "index", points)
 	if err != nil || row.score != 10 || !reflect.DeepEqual(row.points, [][]interface{}{{int64(2000), 10.0}}) {
 		t.Fatalf("row=%+v err=%v", row, err)
+	}
+}
+
+func TestObservedRatio(t *testing.T) {
+	metric := Metric{mode: ratio, Field: "total", Field2: "available", reverseRatio: true}
+	for _, tc := range []struct {
+		name, raw string
+		want      float64
+		valid     bool
+		err       error
+	}{
+		{"paired maxima", `{"doc_count":2,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100],"available":[90]}},{"fields":{"total":[200],"available":[100]}}]}}}`, 90, true, nil},
+		{"missing or zero divisor", `{"doc_count":3,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100]}},{"fields":{"available":[90]}},{"fields":{"total":[0],"available":[90]}}]}}}`, -1, false, nil},
+		{"zero available", `{"doc_count":1,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100],"available":[0]}}]}}}`, 0, true, nil},
+		{"over capacity", `{"doc_count":101}`, 0, false, errBudget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, valid, err := observedRatio(parseSample(t, tc.raw), metric)
+			if !errors.Is(err, tc.err) || valid != tc.valid || got != tc.want {
+				t.Fatalf("got %v %v %v", got, valid, err)
+			}
+		})
+	}
+	if _, _, err := observedRatio(parseSample(t, `{"doc_count":2,"ratio_samples":{"hits":{"hits":[]}}}`), metric); err == nil {
+		t.Fatal("truncated observations accepted")
 	}
 }

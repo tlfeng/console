@@ -15,10 +15,17 @@ type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time      *int64   `json:"key"`
-	Count     int      `json:"doc_count"`
-	Value     *scalar  `json:"value"`
-	Other     *scalar  `json:"other"`
+	Time  *int64  `json:"key"`
+	Count int     `json:"doc_count"`
+	Value *scalar `json:"value"`
+	Other *scalar `json:"other"`
+	Ratio *struct {
+		Hits struct {
+			Rows []struct {
+				Fields map[string][]float64 `json:"fields"`
+			} `json:"hits"`
+		} `json:"hits"`
+	} `json:"ratio_samples"`
 	JVM       *jvmHits `json:"jvm_lifetime"`
 	JVMLegacy *struct {
 		Count int      `json:"doc_count"`
@@ -185,7 +192,15 @@ func (q Query) counterScope() dsl {
 	return dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}}
 }
 
+const ratioSampleLimit = 100 // Default index.max_inner_result_window.
+
 func metricAggs(q Query, metric Metric) dsl {
+	if metric.mode == ratio {
+		return dsl{"ratio_samples": dsl{"top_hits": dsl{
+			"size": ratioSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
+			"docvalue_fields": []string{metric.Field, metric.Field2},
+		}}}
+	}
 	buckets := dsl{"value": maximum(metric.Field)}
 	if metric.Field2 != "" {
 		buckets["other"] = maximum(metric.Field2)

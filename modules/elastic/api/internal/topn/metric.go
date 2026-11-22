@@ -114,13 +114,10 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 		v, valid := number(p.Value)
 		switch metric.mode {
 		case ratio:
-			other, ok := number(p.Other)
-			if metric.reverseRatio {
-				v, other = other, v
-			}
-			valid = valid && ok && other > 0
-			if valid {
-				v = 100 * (v / other)
+			var err error
+			v, valid, err = observedRatio(p, metric)
+			if err != nil {
+				return winner{}, err
 			}
 		case peak:
 			if !valid {
@@ -143,4 +140,28 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 		row.score = max(row.score, v)
 	}
 	return row, nil
+}
+
+func observedRatio(p samples, metric Metric) (float64, bool, error) {
+	if p.Count > ratioSampleLimit {
+		return 0, false, errBudget
+	}
+	if p.Ratio == nil || p.Count <= 0 || len(p.Ratio.Hits.Rows) != p.Count {
+		return 0, false, fmt.Errorf("incomplete ratio observations")
+	}
+	best := -1.0
+	for _, row := range p.Ratio.Hits.Rows {
+		a, b := row.Fields[metric.Field], row.Fields[metric.Field2]
+		if metric.reverseRatio {
+			a, b = b, a
+		}
+		if len(a) != 1 || len(b) != 1 || a[0] < 0 || b[0] <= 0 {
+			continue
+		}
+		v := a[0] / b[0] * 100
+		if !math.IsNaN(v) && !math.IsInf(v, 0) {
+			best = max(best, v)
+		}
+	}
+	return best, best >= 0, nil
 }

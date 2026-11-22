@@ -151,16 +151,16 @@ func TestEasysearchSnapshot(t *testing.T) {
 		t.Fatal("single search and PIT pagination disagree")
 	}
 
-	for _, row := range []struct {
+	for i, row := range []struct {
 		name             string
 		total, available int
-	}{{"large", 1000, 100}, {"small", 100, 90}, {"full", 50, 0}} {
-		must("PUT", "/"+index+"/_doc/disk-"+row.name+"?refresh=true", dsl{
+	}{{"large", 1000, 100}, {"small", 100, 90}, {"small", 200, 100}, {"middle", 100, 60}, {"full", 50, 0}} {
+		must("PUT", "/"+index+fmt.Sprintf("/_doc/disk-%d?refresh=true", i), dsl{
 			"timestamp": epoch + 2001, "total": row.total, "available": row.available,
 			"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "biz", "transport_address": row.name}},
 		})
 	}
-	q.Source, q.N = "node_stats", 3
+	q.Source, q.N = "node_stats", 4
 	for _, usePIT := range []bool{false, true} {
 		pred, _ := q.filter()
 		disk, _ := NewMetric(&common.MetricItem{Key: "disk"}, "total", "available", "%", "ratio", false)
@@ -181,8 +181,8 @@ func TestEasysearchSnapshot(t *testing.T) {
 		for i, want := range []struct {
 			name  string
 			score float64
-		}{{"small", 90}, {"large", 10}, {"full", 0}} {
-			if len(disk.Item.Lines) != 3 || disk.Item.Lines[i].Metric.Label != want.name || !reflect.DeepEqual(disk.Item.Lines[i].Data, [][]interface{}{{int64(epoch + 2000), want.score}}) {
+		}{{"small", 90}, {"middle", 60}, {"large", 10}, {"full", 0}} {
+			if len(disk.Item.Lines) != 4 || disk.Item.Lines[i].Metric.Label != want.name || !reflect.DeepEqual(disk.Item.Lines[i].Data, [][]interface{}{{int64(epoch + 2000), want.score}}) {
 				t.Fatalf("PIT=%v: incorrect disk ranking or points", usePIT)
 			}
 		}

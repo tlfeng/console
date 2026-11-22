@@ -95,8 +95,7 @@ export default (props) => {
         const error = formatResponse(res);
         setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
       } else if (res && !res.error) {
-        const { metrics = {} } = res || {};
-        const metric = metrics[metricKey]
+        const metric = res.metrics?.[metricKey];
         setError()
         setMetric(formatMetric && metric ? formatMetric(metric) : metric);
       }
