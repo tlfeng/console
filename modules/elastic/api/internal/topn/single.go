@@ -17,6 +17,12 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		return errBudget
 	}
 	entityTerms := terms(q.entity(), limit+1)
+	if q.selected != nil {
+		if len(q.selected) > limit {
+			return errBudget
+		}
+		entityTerms = terms(q.entity(), len(q.selected))
+	}
 	entityTerms["order"] = dsl{"_key": "asc"}
 	// Every shard containing a globally first L+1 key also has it in its
 	// local first L+1. Fewer than L+1 results therefore prove completeness.
@@ -93,9 +99,16 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if entities == nil {
 		return errors.New("missing TopN entities")
 	}
-	if len(entities) > limit+1 {
+	maxEntities := limit + 1
+	var selected map[string]winner
+	if q.selected != nil {
+		maxEntities = len(q.selected)
+		selected = make(map[string]winner, maxEntities)
+	}
+	if len(entities) > maxEntities {
 		return errors.New("oversized TopN entity response")
 	}
+	truncated := q.selected == nil && len(entities) == limit+1
 	best := make([]winner, 0, q.N)
 	allowed := q.authorizer()
 	last := ""
@@ -107,17 +120,31 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 			return errors.New("invalid TopN entity buckets")
 		}
 		last = b.Key
-		if len(entities) == limit+1 {
+		if truncated {
 			continue
 		}
 		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
 		if err != nil {
 			return err
 		}
-		best = keepWinner(best, candidate, q.N)
+		if selected != nil {
+			if len(candidate.points) > 0 {
+				selected[b.Key] = candidate
+			}
+		} else {
+			best = keepWinner(best, candidate, q.N)
+		}
 	}
-	if len(entities) == limit+1 {
+	if truncated {
 		return errCandidateLimit
+	}
+	if selected != nil {
+		for _, name := range q.selected {
+			if row, ok := selected[name]; ok {
+				display(q, metric, row.name, row.points)
+			}
+		}
+		return nil
 	}
 	for _, row := range best {
 		display(q, metric, row.name, row.points)

@@ -119,6 +119,48 @@ func TestEasysearchSnapshot(t *testing.T) {
 		t.Fatalf("expected single search to see the late write, got %+v", single.Item.Lines)
 	}
 
+	t.Run("selected indexing rate matches automatic points", func(t *testing.T) {
+		for _, p := range []struct {
+			id, name  string
+			ts, value int
+		}{
+			{"a0", "a", 1, 10}, {"a4", "a", 4001, 75}, {"a5", "a", 5001, 80},
+		} {
+			add(p.id, p.name, p.ts, p.value)
+		}
+		base := Query{Cluster: "biz", Source: "index_stats", Min: epoch + 1001, Max: epoch + 5999, Width: 1, N: 2, Indices: []string{"a", "b", "missing"}}
+		makeMetric := func() Metric {
+			return Metric{Item: &common.MetricItem{Key: "indexing_rate"}, Field: "metric", mode: rate}
+		}
+		pred, _ := base.filter()
+		auto := makeMetric()
+		if err := runQuery(ctx, call, pitFor(elastic.Version{Distribution: elastic.Easysearch}), alias, pred, base, auto, true); err != nil {
+			t.Fatal(err)
+		}
+		if len(auto.Item.Lines) != 2 || auto.Item.Lines[0].Metric.Label != "b" {
+			t.Fatalf("unexpected automatic order: %+v", auto.Item.Lines)
+		}
+		base.selected = selectEntities(base, "a,secret,missing,b,a,_all")
+		base.N = 1 // Must not truncate the selected curves.
+		pred, _ = base.filter()
+		manual := makeMetric()
+		if err := singleSearch(ctx, call, alias, pred, base, manual, true); err != nil {
+			t.Fatal(err)
+		}
+		if len(manual.Item.Lines) != 2 || manual.Item.Lines[0].Metric.Label != "a" || manual.Item.Lines[1].Metric.Label != "b" {
+			t.Fatalf("unexpected manual selection: %+v", manual.Item.Lines)
+		}
+		for i, line := range manual.Item.Lines {
+			if !reflect.DeepEqual(line.Data, auto.Item.Lines[1-i].Data) {
+				t.Fatalf("%s: manual %v != automatic %v", line.Metric.Label, line.Data, auto.Item.Lines[1-i].Data)
+			}
+		}
+		want := [][]interface{}{{int64(epoch + 1000), 0.0}, {int64(epoch + 2000), 40.0}, {int64(epoch + 3000), nil}, {int64(epoch + 5000), 5.0}}
+		if !reflect.DeepEqual(manual.Item.Lines[0].Data, want) {
+			t.Fatalf("missing pre-read, zero or gap: got %v want %v", manual.Item.Lines[0].Data, want)
+		}
+	})
+
 	for i := 0; i < 65; i++ {
 		name := fmt.Sprintf("page-%03d", i)
 		add(name+"-1", name, 1001, 1)
@@ -188,6 +230,48 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 	}
 
+	t.Run("selected node gauges and ratios", func(t *testing.T) {
+		for _, key := range []string{"cpu", "disk"} {
+			makeMetric := func() Metric {
+				if key == "disk" {
+					metric, _ := NewMetric(&common.MetricItem{Key: key}, "total", "available", "%", "ratio", false)
+					return metric
+				}
+				return Metric{Item: &common.MetricItem{Key: key}, Field: "available"}
+			}
+			auto, manual := makeMetric(), makeMetric()
+			pred, _ := q.filter()
+			if err := singleSearch(ctx, call, alias, pred, q, auto, false); err != nil {
+				t.Fatal(err)
+			}
+			selected := q
+			selected.N = 1
+			selected.selected = selectEntities(q, "full,small,missing,full")
+			pred, _ = selected.filter()
+			if err := runSelected(ctx, call, alias, pred, selected, manual, false); err != nil {
+				t.Fatal(err)
+			}
+			if len(manual.Item.Lines) != 2 {
+				t.Fatalf("%s: missing selected curves", key)
+			}
+			for i, name := range []string{"full", "small"} {
+				line := manual.Item.Lines[i]
+				if line.Metric.Label != name {
+					t.Fatalf("%s: got %s, want %s", key, line.Metric.Label, name)
+				}
+				matched := false
+				for _, other := range auto.Item.Lines {
+					if other.Metric.Label == name && reflect.DeepEqual(other.Data, line.Data) {
+						matched = true
+					}
+				}
+				if !matched {
+					t.Fatalf("%s: %s disagrees with automatic curve", key, name)
+				}
+			}
+		}
+	})
+
 	t.Run("restart inside bucket", func(t *testing.T) {
 		for _, history := range []string{"legacy", "mixed", "summary"} {
 			t.Run(history, func(t *testing.T) {
@@ -211,6 +295,16 @@ func TestEasysearchSnapshot(t *testing.T) {
 					mode               metricMode
 					want               float64
 				}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "metric", latency, 3}} {
+					selected := restart
+					selected.selected = selectEntities(selected, "n1")
+					metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
+					pred, _ := selected.filter()
+					if err := runSelected(ctx, call, alias, pred, selected, metric, false); err != nil {
+						t.Fatal(err)
+					}
+					if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
+						t.Fatalf("%s selected: wrong recovery point", tc.key)
+					}
 					for _, usePIT := range []bool{false, true} {
 						pred, _ := restart.filter()
 						metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}

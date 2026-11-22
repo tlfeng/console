@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,29 +40,38 @@ type config struct {
 
 // Window preserves the exact client bounds rather than the legacy seconds conversion.
 func Window(req *http.Request, width int) (int64, int64, int, bool) {
-	q := req.URL.Query()
-	min, err := parseTime(q.Get("min"))
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	max, err := parseTime(q.Get("max"))
-	if err != nil || min < 0 || max <= min || width <= 0 || width > 86400*365 {
+	min, max, ok := windowBounds(req, width)
+	if !ok {
 		return 0, 0, 0, false
 	}
 	n := 5
-	if raw := q.Get("top"); raw != "" {
+	if raw := req.URL.Query().Get("top"); raw != "" {
+		var err error
 		n, err = strconv.Atoi(raw)
 		if err != nil || n < 1 || n > 20 {
 			return 0, 0, 0, false
 		}
 	}
+	return min, max, n, true
+}
+
+func windowBounds(req *http.Request, width int) (int64, int64, bool) {
+	q := req.URL.Query()
+	min, err := parseTime(q.Get("min"))
+	if err != nil {
+		return 0, 0, false
+	}
+	max, err := parseTime(q.Get("max"))
+	if err != nil || min < 0 || max <= min || width <= 0 || width > 86400*365 {
+		return 0, 0, false
+	}
 	if raw := q.Get("bucket_size"); raw != "" {
 		d, err := util.ParseDuration(raw)
 		if err != nil || d < time.Second || d%time.Second != 0 {
-			return 0, 0, 0, false
+			return 0, 0, false
 		}
 	}
-	return min, max, n, true
+	return min, max, true
 }
 
 func parseTime(raw string) (int64, error) {
@@ -81,6 +91,7 @@ type Query struct {
 	Width, N        int
 	AllIndices      bool
 	Indices         []string
+	selected        []string
 	rawFrom         int64
 	storeScope      string
 	legacyInterval  bool
@@ -99,19 +110,21 @@ func (q Query) filter() (dsl, bool) {
 	pred := dsl{"filter": filters}
 	if q.Source == "index_stats" {
 		pred["must_not"] = []dsl{{"term": dsl{q.entity(): "_all"}}}
-		if !q.AllIndices {
-			if len(q.Indices) == 0 || len(q.Indices) > 1024 {
+	}
+	if q.selected != nil {
+		pred["filter"] = append(filters, dsl{"terms": dsl{q.entity(): q.selected}})
+	} else if q.Source == "index_stats" && !q.AllIndices {
+		if len(q.Indices) == 0 || len(q.Indices) > 1024 {
+			return nil, false
+		}
+		allowed := make([]dsl, 0, len(q.Indices))
+		for _, pattern := range q.Indices {
+			if !aclPattern.MatchString(pattern) || strings.Contains(pattern, "**") {
 				return nil, false
 			}
-			allowed := make([]dsl, 0, len(q.Indices))
-			for _, pattern := range q.Indices {
-				if !aclPattern.MatchString(pattern) || strings.Contains(pattern, "**") {
-					return nil, false
-				}
-				allowed = append(allowed, dsl{"wildcard": dsl{q.entity(): pattern}})
-			}
-			pred["filter"] = append(filters, dsl{"bool": dsl{"should": allowed, "minimum_should_match": 1}})
+			allowed = append(allowed, dsl{"wildcard": dsl{q.entity(): pattern}})
 		}
+		pred["filter"] = append(filters, dsl{"bool": dsl{"should": allowed, "minimum_should_match": 1}})
 	}
 	return pred, true
 }
@@ -119,6 +132,9 @@ func (q Query) filter() (dsl, bool) {
 // The engine's wildcard filter is a candidate filter. Verify returned keys
 // with the same matcher used by Console's existing index authorization.
 func (q Query) authorizer() func(string) bool {
+	if q.selected != nil {
+		return func(name string) bool { return slices.Contains(q.selected, name) }
+	}
 	if q.Source != "index_stats" || q.AllIndices {
 		return func(string) bool { return true }
 	}
@@ -538,11 +554,14 @@ func (cfg config) rawSource() (string, int64, error) {
 }
 
 func calculate(ctx context.Context, q Query, metric Metric) error {
+	if q.selected != nil && len(q.selected) == 0 {
+		return nil
+	}
 	var cfg config
 	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return errUnavailable
 	}
-	materialized := useMaterialized(q, metric) && cfg.TopN.Materialized.enabled(q.Cluster, metric.Item.Key)
+	materialized := q.selected == nil && useMaterialized(q, metric) && cfg.TopN.Materialized.enabled(q.Cluster, metric.Item.Key)
 	if materialized && !q.AllIndices && len(q.Indices) == 0 {
 		return nil
 	}
@@ -573,6 +592,9 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	}
 	q.setSearchVersion(version)
 	q.storeScope = scope
+	if q.selected != nil {
+		return runSelected(ctx, call, index, pred, q, metric, cfg.TopN.RawFrom == "")
+	}
 	if materialized {
 		m, err := cfg.TopN.Materialized.store(index, from)
 		if err != nil {

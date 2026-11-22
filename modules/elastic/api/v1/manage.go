@@ -570,27 +570,33 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		h.WriteJSON(w, resBody, http.StatusInternalServerError)
 		return
 	}
-	if req.URL.Query().Get("advanced_topn") == "true" && h.Get(req, "index_name", "") == "" {
-		defs := indexMetricItemsForKey(h.GetParameter(req, "key"))
+	indexName := h.Get(req, "index_name", "")
+	key := h.GetParameter(req, "key")
+	if req.URL.Query().Get("advanced_topn") == "true" {
+		defs := indexMetricItemsForKey(key)
 		if len(defs) == 1 {
 			def := defs[0]
 			metric, supported := topn.NewMetric(def.MetricItem, def.Field, def.Field2, def.Units, def.FormatType, def.IsDerivative)
 			if supported {
+				q := topn.Query{Cluster: id, Source: "index_stats", Width: bucketSize}
+				if indexName != "" {
+					q.Indices, q.AllIndices = h.GetAllowedIndices(req, id)
+					topn.ServeSelected(w, req, q, metric, indexName)
+					return
+				}
 				min, max, n, valid := topn.Window(req, bucketSize)
 				if !valid {
 					topn.WriteStatus(w, "invalid_request")
 					return
 				}
-				q := topn.Query{Cluster: id, Source: "index_stats", Min: min, Max: max, Width: bucketSize, N: n}
+				q.Min, q.Max, q.N = min, max, n
 				q.Indices, q.AllIndices = h.GetAllowedIndices(req, id)
 				topn.Serve(w, req, q, metric)
 				return
 			}
 		}
 	}
-	indexName := h.Get(req, "index_name", "")
 	top := h.GetIntOrDefault(req, "top", 5)
-	key := h.GetParameter(req, "key")
 	timeout := h.GetParameterOrDefault(req, "timeout", "60s")
 	du, err := time.ParseDuration(timeout)
 	if err != nil {
