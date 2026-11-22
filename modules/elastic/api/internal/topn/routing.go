@@ -14,15 +14,14 @@ const (
 var pitHints = routingHints{expires: make(map[routingKey]time.Time)}
 
 type routingKey struct {
-	store, cluster, index      string
-	field, field2              string
-	mode                       metricMode
-	width                      int
-	duration, buckets, rawFrom int64
-	checkHistory               bool
+	store, cluster, index string
+	field, field2         string
+	mode                  metricMode
+	width                 int
+	duration, buckets     int64
 }
 
-func nodeRoutingKey(q Query, metric Metric, api pitAPI, index string, checkHistory bool) (routingKey, bool) {
+func nodeRoutingKey(q Query, metric Metric, api pitAPI, index string) (routingKey, bool) {
 	// Node authorization is cluster-wide. Index requests have a separate
 	// per-index authorization filter and never participate in this cache.
 	if q.Width <= 0 || q.storeScope == "" || q.Source != "node_stats" || api.path == "" {
@@ -33,7 +32,6 @@ func nodeRoutingKey(q Query, metric Metric, api pitAPI, index string, checkHisto
 		store: q.storeScope, cluster: q.Cluster, index: index,
 		field: metric.Field, field2: metric.Field2, mode: metric.mode,
 		width: q.Width, duration: q.Max - q.Min, buckets: q.Max/width - q.Min/width + 1,
-		rawFrom: q.rawFrom, checkHistory: checkHistory,
 	}, true
 }
 

@@ -100,15 +100,16 @@ func TestMixedJVMLifetime(t *testing.T) {
 	}
 }
 
-func TestRawCoverageDoesNotReadPartialPreviousBucket(t *testing.T) {
+func TestCounterScopeDoesNotReadHiddenPartOfFirstBucket(t *testing.T) {
 	q := Query{Min: 3500, Max: 5999, Width: 1}
-	for _, tc := range []struct {
-		from int64
-		want int
-	}{{2000, 2}, {2001, 1}, {3500, 1}} {
-		q.rawFrom = tc.from
-		if got := len(q.counterScope()["bool"].(dsl)["should"].([]dsl)); got != tc.want {
-			t.Fatalf("raw_from=%d: got %d ranges, want %d", tc.from, got, tc.want)
+	got := q.counterScope()["bool"].(dsl)["should"].([]dsl)
+	if len(got) != 2 {
+		t.Fatalf("got %v", got)
+	}
+	for i, want := range [][2]int64{{3500, 5999}, {2000, 2999}} {
+		r := got[i]["range"].(dsl)["timestamp"].(dsl)
+		if r["gte"] != want[0] || r["lte"] != want[1] {
+			t.Fatalf("got %v", r)
 		}
 	}
 }

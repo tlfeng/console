@@ -45,16 +45,12 @@ func TestMaterializedRank(t *testing.T) {
 
 func TestMaterializedRequiresEveryBucket(t *testing.T) {
 	ctx := context.Background()
-	m := materializedStore{raw: "raw", index: ".console-topn-test", from: 1, gaps: []coverageGap{{3000, 4000}}}
-	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 4999, Width: 1, N: 1, AllIndices: true, rawFrom: 1}
-	never := func(context.Context, string, string, dsl) ([]byte, error) {
-		t.Fatal("must not read across a declared gap")
-		return nil, nil
+	m := materializedStore{raw: "raw", index: ".console-topn-test", gaps: []coverageGap{{3000, 4000}}}
+	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 4999, Width: 1, N: 1, AllIndices: true}
+	sealed, edges := summaryPlan(m, q, time.UnixMilli(9999999))
+	if !reflect.DeepEqual(sealed, []int64{2000}) || len(edges) != 0 {
+		t.Fatalf("declared gap must only suppress affected transitions: %v %v", sealed, edges)
 	}
-	if err := readMaterialized(ctx, never, pitAPI{path: "/_pit"}, m, q, materializedMetric(writeRateKey), time.UnixMilli(9999999)); !errors.Is(err, errSummaryHistory) {
-		t.Fatal(err)
-	}
-	m.gaps = nil
 	s := snapshot{id: "ok", shards: 1, call: func(context.Context, string, string, dsl) ([]byte, error) {
 		return []byte(fmt.Sprintf(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"hits":[{"_id":%q,"_source":{"v":1,"t":2000,"n":[],"s":[]}}]}}`, m.metricID(q, writeRateKey, 2000))), nil
 	}}
@@ -65,8 +61,8 @@ func TestMaterializedRequiresEveryBucket(t *testing.T) {
 
 func TestMaterializedFailedSearchDoesNotPublish(t *testing.T) {
 	ctx := context.Background()
-	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 2999, Width: 1, N: 1, AllIndices: true, rawFrom: 1}
-	m := materializedStore{index: ".console-topn-test", raw: "raw", from: 1}
+	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 2999, Width: 1, N: 1, AllIndices: true}
+	m := materializedStore{index: ".console-topn-test", raw: "raw"}
 	var writes, closes int
 	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
 		switch {

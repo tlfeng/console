@@ -24,15 +24,17 @@ const (
 )
 
 var errSummaryHistory = errors.New("automatic TopN summary coverage unavailable")
+var errSummaryMissing = fmt.Errorf("missing summary bucket: %w", errSummaryHistory)
 
 type materializedConfig struct {
-	Index       string   `config:"index"`
-	Read        bool     `config:"read"`
-	Writer      bool     `config:"writer"`
-	Clusters    []string `config:"clusters"`
-	Metrics     []string `config:"metrics"`
-	ReadMetrics []string `config:"read_metrics"`
-	Gaps        []struct {
+	Enabled        bool     `config:"enabled"`
+	ReadOverride   *bool    `config:"read"`
+	WriterOverride *bool    `config:"writer"`
+	Index          string   `config:"index"`
+	Clusters       []string `config:"clusters"`
+	Metrics        []string `config:"metrics"`
+	ReadMetrics    []string `config:"read_metrics"`
+	Gaps           []struct {
 		From  string `config:"from"`
 		Until string `config:"until"`
 	} `config:"raw_gaps"`
@@ -42,31 +44,40 @@ type coverageGap struct{ from, until int64 }
 
 type materializedStore struct {
 	index, raw string
-	from       int64
 	gaps       []coverageGap
 }
 
-func (c materializedConfig) enabled(cluster, key string) bool {
-	if !c.Read || !slices.Contains(c.readMetricKeys(), key) {
-		return false
+func (c materializedConfig) reads() bool {
+	if c.ReadOverride != nil {
+		return *c.ReadOverride
 	}
-	for _, id := range c.Clusters {
-		if cluster == id && id != "" {
-			return true
-		}
-	}
-	return false
+	return c.Enabled
 }
 
-func (c materializedConfig) store(raw string, from int64) (materializedStore, error) {
+func (c materializedConfig) writes() bool {
+	if c.WriterOverride != nil {
+		return *c.WriterOverride
+	}
+	return c.Enabled
+}
+
+func (c materializedConfig) enabled(cluster, key string) bool {
+	return cluster != "" && c.reads() && slices.Contains(c.readMetricKeys(), key) &&
+		(c.Enabled && len(c.Clusters) == 0 || slices.Contains(c.Clusters, cluster))
+}
+
+func (c materializedConfig) store(raw string) (materializedStore, error) {
+	if c.Enabled && c.Index == "" {
+		c.Index = ".console-topn-index-rate-v1"
+	}
 	// Explicit concrete index outside the original monitoring and rollup namespace.
-	if !rawName.MatchString(c.Index) || !strings.HasPrefix(c.Index, ".console-topn-") || c.Index == raw || from <= 0 {
+	if !rawName.MatchString(c.Index) || !strings.HasPrefix(c.Index, ".console-topn-") || c.Index == raw {
 		return materializedStore{}, errSummaryHistory
 	}
 	if err := c.validateMetrics(); err != nil {
 		return materializedStore{}, err
 	}
-	m := materializedStore{index: c.Index, raw: raw, from: from}
+	m := materializedStore{index: c.Index, raw: raw}
 	for _, gap := range c.Gaps {
 		a, e := parseTime(gap.From)
 		b, f := parseTime(gap.Until)
@@ -79,9 +90,6 @@ func (c materializedConfig) store(raw string, from int64) (materializedStore, er
 }
 
 func (m materializedStore) covered(from, max int64) bool {
-	if from < m.from {
-		return false
-	}
 	for _, gap := range m.gaps {
 		if from < gap.until && max >= gap.from {
 			return false
@@ -143,7 +151,7 @@ func materializedScopes(q Query, seal int64) ([]int64, map[int64]bool) {
 	edges := map[int64]bool{}
 	for ts := first; ts <= last; ts += w {
 		// A clipped first bucket also changes the next transition's baseline.
-		if (q.Min != first && ts <= first+w) || ts+w-1 > q.Max || ts+w > seal || ts-w < q.rawFrom {
+		if (q.Min != first && ts <= first+w) || ts+w-1 > q.Max || ts+w > seal || ts-w < 0 {
 			edges[ts] = true
 		} else {
 			sealed = append(sealed, ts)
@@ -202,7 +210,7 @@ func readMetricScoreBuckets(ctx context.Context, s *snapshot, q Query, m materia
 		out = append(out, row.Source)
 	}
 	if len(want) != 0 {
-		return nil, errSummaryHistory
+		return out, errSummaryMissing
 	}
 	return out, nil
 }

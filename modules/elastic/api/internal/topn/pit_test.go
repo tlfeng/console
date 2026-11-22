@@ -114,7 +114,7 @@ func TestQueryRouting(t *testing.T) {
 			if tc.usePIT {
 				selected = api
 			}
-			if err := runQuery(context.Background(), call, selected, "raw", pred, q, metric, false); err != nil {
+			if err := runQuery(context.Background(), call, selected, "raw", pred, q, metric); err != nil {
 				t.Fatal(err)
 			}
 			if !reflect.DeepEqual(calls, tc.want) {

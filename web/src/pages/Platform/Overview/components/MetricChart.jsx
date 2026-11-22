@@ -58,13 +58,24 @@ export default (props) => {
   
     const firstFetchRef = useRef(true)
     const activeRequestRef = useRef()
+    const pendingRequestRef = useRef()
 
     const [timeInterval, setTimeInterval] = useState()
   
+    const { min: queryMin, max: queryMax, ...selection } = queryParams || {}
+    // A tick re-resolves a relative range. Its pending job keeps the absolute
+    // bounds from submission; a change to the selection or range cancels it.
+    const chartQuery = JSON.stringify([
+      fetchUrl, metricKey, timeInterval, timeout, advancedTopN, selection,
+      timeRange?.min ?? queryMin, timeRange?.max ?? queryMax
+    ])
+
     const fetchData = async (queryParams, fetchUrl, metricKey, timeInterval, showLoading) => {
       if (!observerRef.current.isInView || !fetchUrl) return;
       let controller;
       if (advancedTopN) {
+        if (pendingRequestRef.current?.key === chartQuery &&
+            !pendingRequestRef.current.controller.signal.aborted) return;
         activeRequestRef.current?.abort();
         controller = new AbortController();
         activeRequestRef.current = controller;
@@ -81,16 +92,43 @@ export default (props) => {
       if (timeInterval) {
         newQueryParams.bucket_size = timeInterval
       }
-      const res = await request(fetchUrl, {
-        method: 'GET',
-        queryParams: newQueryParams,
-        ignoreTimeout: true,
-        ...(controller ? { signal: controller.signal } : {})
-      }, false, false)
+      if (advancedTopN) newQueryParams.topn_async = true
+      const started = Date.now()
+      let res
+      do {
+        res = await request(fetchUrl, {
+          method: 'GET',
+          queryParams: newQueryParams,
+          ignoreTimeout: true,
+          ...(controller ? { signal: controller.signal, expirys: false } : {})
+        }, false, false)
+        if (!controller || controller.signal.aborted || res?.topn_status !== 'pending') break
+        pendingRequestRef.current = { key: chartQuery, controller }
+        setMetric(undefined)
+        setLoading(true)
+        setError(formatMessage({ id: 'cluster.metrics.topn.pending' }))
+        if (Date.now() - started >= 90000) {
+          res = { topn_status: 'timed_out' }
+          break
+        }
+        await new Promise((resolve) => {
+          const finish = () => {
+            clearTimeout(timer)
+            controller.signal.removeEventListener('abort', finish)
+            resolve()
+          }
+          const timer = setTimeout(finish, 2000)
+          controller.signal.addEventListener('abort', finish, { once: true })
+        })
+      } while (!controller.signal.aborted)
+      if (pendingRequestRef.current?.controller === controller) pendingRequestRef.current = undefined;
       if (controller?.signal.aborted) return;
       if (advancedTopN && res?.topn_status) {
         setMetric(undefined);
         setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }));
+      } else if (advancedTopN && (!res || res instanceof Error)) {
+        setMetric(undefined);
+        setError(formatMessage({ id: "cluster.metrics.topn.query_failed" }));
       } else if (res?.error) {
         const error = formatResponse(res);
         setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
@@ -115,8 +153,9 @@ export default (props) => {
         observerRef.current.lastDeps = cloneDeep(observerRef.current.deps);
       }
       fetchData(queryParams, fetchUrl, metricKey, timeInterval, refresh)
-      return () => activeRequestRef.current?.abort();
-    }, [JSON.stringify(queryParams), fetchUrl, metricKey, timeInterval, refresh])
+    }, [JSON.stringify(queryParams), chartQuery, refresh])
+
+    useEffect(() => () => activeRequestRef.current?.abort(), [chartQuery]);
   
     useEffect(() => {
       const observer = new IntersectionObserver(
@@ -130,6 +169,10 @@ export default (props) => {
               }
             } else {
               observerRef.current.isInView = false
+              if (advancedTopN) {
+                activeRequestRef.current?.abort();
+                observerRef.current.lastDeps = undefined;
+              }
             }
           });
         },
@@ -171,7 +214,7 @@ export default (props) => {
       if (error) {
         return (
           <div style={{ height, padding: 10 }}>
-            <Alert style={{ maxHeight: '100%', overflow: 'auto', wordBreak: 'break-all'}} message={error} type="error"/>
+            <Alert style={{ maxHeight: '100%', overflow: 'auto', wordBreak: 'break-all'}} message={error} type={loading ? "info" : "error"}/>
           </div>
         )
       }

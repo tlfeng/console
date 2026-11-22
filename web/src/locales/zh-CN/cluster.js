@@ -1,6 +1,8 @@
 export default {
+  "cluster.metrics.topn.pending": "正在根据可用监控数据计算 TopN…",
+  "cluster.metrics.topn.busy": "TopN 后台计算繁忙，请稍后重试。",
   "cluster.metrics.topn.summary_unavailable": "索引指标摘要尚未覆盖此时间范围。请选择其他时间范围，或手选索引。",
-  "cluster.metrics.topn.history_unavailable": "无法确认此时间范围内的原始监控数据。请选择较近的时间范围，或手选索引或节点。",
+  "cluster.metrics.topn.history_unavailable": "此查询无法读取原始监控数据源。",
   "cluster.metrics.topn.budget_exceeded": "自动 TopN 超过查询限额。请缩短时间范围、调粗粒度，或手选索引或节点。",
   "cluster.metrics.topn.timed_out": "自动 TopN 查询超时。请缩短时间范围、调粗粒度，或手选索引或节点。",
   "cluster.metrics.topn.unavailable": "当前监控环境无法计算自动 TopN。请手选索引或节点查看指标。",

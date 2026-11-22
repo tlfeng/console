@@ -188,7 +188,7 @@ func (q Query) counterScope() dsl {
 	first := q.Min / width * width
 	// Read the complete preceding bucket, but never include the hidden part of the first visible bucket.
 	scope := []dsl{filterRange(q.Min, q.Max)}
-	if first > 0 && first-width >= q.rawFrom {
+	if first >= width {
 		scope = append(scope, filterRange(first-width, first-1))
 	}
 	return dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}}

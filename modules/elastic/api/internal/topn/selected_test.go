@@ -45,7 +45,7 @@ func TestSelectedSearchBudgetRejectsBeforeQuery(t *testing.T) {
 		return nil, nil
 	}
 	m := materializedMetric(writeRateKey)
-	if err := singleSearch(context.Background(), call, "raw", pred, q, m, true); !errors.Is(err, errBudget) || len(m.Item.Lines) != 0 {
+	if err := singleSearch(context.Background(), call, "raw", pred, q, m); !errors.Is(err, errBudget) || len(m.Item.Lines) != 0 {
 		t.Fatalf("err=%v lines=%v", err, m.Item.Lines)
 	}
 }

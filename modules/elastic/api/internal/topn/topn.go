@@ -33,7 +33,6 @@ var (
 type config struct {
 	TopN struct {
 		RawIndex     string             `config:"raw_index"`
-		RawFrom      string             `config:"raw_from"`
 		Materialized materializedConfig `config:"materialized"`
 	} `config:"topn"`
 }
@@ -92,7 +91,6 @@ type Query struct {
 	AllIndices      bool
 	Indices         []string
 	selected        []string
-	rawFrom         int64
 	storeScope      string
 	legacyInterval  bool
 }
@@ -180,6 +178,12 @@ type requester interface {
 
 type caller func(context.Context, string, string, dsl) ([]byte, error)
 
+type monitoringHTTPError int
+
+func (e monitoringHTTPError) Error() string {
+	return fmt.Sprintf("monitoring store returned HTTP %d", e)
+}
+
 func monitoredStore() (caller, elastic.Version, string) {
 	id, _ := global.Lookup(elastic.GlobalSystemElasticsearchID).(string)
 	if id == "" {
@@ -214,7 +218,7 @@ func monitoredStore() (caller, elastic.Version, string) {
 			return nil, errors.New("missing monitoring response")
 		}
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
-			return res.Body, fmt.Errorf("monitoring store returned HTTP %d", res.StatusCode)
+			return res.Body, monitoringHTTPError(res.StatusCode)
 		}
 		return res.Body, nil
 	}, client.GetVersion(), id + "\x00" + base
@@ -255,11 +259,12 @@ func pitFor(version elastic.Version) pitAPI {
 }
 
 type snapshot struct {
-	call   caller
-	api    pitAPI
-	id     string
-	shards int
-	bytes  int
+	call          caller
+	api           pitAPI
+	id            string
+	shards        int
+	bytes         int
+	responseLimit int
 }
 
 func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot, error) {
@@ -367,7 +372,11 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if err != nil && len(raw) == 0 {
 		return err
 	}
-	if len(raw) > responseLimit-s.bytes {
+	limit := s.responseLimit
+	if limit == 0 {
+		limit = responseLimit
+	}
+	if len(raw) > limit-s.bytes {
 		return errBudget
 	}
 	var response searchResponse
@@ -383,6 +392,9 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	s.bytes += len(raw)
 	if response.TimedOut != nil && *response.TimedOut {
 		return context.DeadlineExceeded
+	}
+	if response.Origin != "" {
+		return errRawHistory
 	}
 	if !response.complete() || response.Shards.Total != s.shards {
 		return errors.New("incomplete monitoring search")
@@ -459,26 +471,6 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
-// retainedAt checks for original samples at or before the visible window starts,
-// not at the start of the optional counter pre-read bucket. It uses
-// the same snapshot. This is a history guard, not a guarantee of collection
-// completeness or of retention for every entity.
-func (s *snapshot) retainedAt(ctx context.Context, pred dsl, min int64) (bool, error) {
-	coverage := dsl{
-		"filter": filterRange(0, min),
-	}
-	var result struct {
-		Count *int64 `json:"doc_count"`
-	}
-	if err := s.search(ctx, pred, coverage, &result); err != nil {
-		return false, err
-	}
-	if result.Count == nil {
-		return false, errors.New("missing raw sample coverage result")
-	}
-	return *result.Count > 0, nil
-}
-
 var slots = make(chan struct{}, 4)
 
 var errUnavailable = errors.New("automatic TopN unavailable")
@@ -493,7 +485,8 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	err = calculate(ctx, q, metric)
+	w.Header().Set("Cache-Control", "no-store")
+	err = calculate(ctx, q, metric, r.URL.Query().Get("topn_async") == "true")
 	if err == nil && ctx.Err() != nil {
 		err = ctx.Err()
 	}
@@ -513,6 +506,10 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 
 func failureStatus(err error) string {
 	switch {
+	case errors.Is(err, errSummaryPending):
+		return "pending"
+	case errors.Is(err, errSummaryBusy):
+		return "busy"
 	case errors.Is(err, errSummaryHistory):
 		return "summary_unavailable"
 	case errors.Is(err, errRawHistory):
@@ -533,7 +530,7 @@ func WriteStatus(w http.ResponseWriter, status string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"topn_status": status})
 }
 
-func (cfg config) rawSource() (string, int64, error) {
+func (cfg config) rawSource() (string, error) {
 	index := cfg.TopN.RawIndex
 	if index == "" {
 		// Use the original write alias, not the legacy search wildcard that
@@ -541,19 +538,12 @@ func (cfg config) rawSource() (string, int64, error) {
 		index = orm.GetIndexName(event.Event{})
 	}
 	if !rawName.MatchString(index) || index == "_all" {
-		return "", 0, errRawHistory
+		return "", errRawHistory
 	}
-	if cfg.TopN.RawFrom == "" {
-		return index, 0, nil
-	}
-	from, err := parseTime(cfg.TopN.RawFrom)
-	if err != nil || from < 0 {
-		return "", 0, errRawHistory
-	}
-	return index, from, nil
+	return index, nil
 }
 
-func calculate(ctx context.Context, q Query, metric Metric) error {
+func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	if q.selected != nil && len(q.selected) == 0 {
 		return nil
 	}
@@ -569,14 +559,10 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	if !ok {
 		return errUnavailable
 	}
-	index, from, err := cfg.rawSource()
+	index, err := cfg.rawSource()
 	if err != nil {
 		return err
 	}
-	if q.Min < from {
-		return errRawHistory
-	}
-	q.rawFrom = from
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
 		return errBudget
 	}
@@ -584,25 +570,38 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	if call == nil {
 		return errUnavailable
 	}
+	q.setSearchVersion(version)
+	q.storeScope = scope
+	api := pitFor(version)
+	var m materializedStore
+	if materialized {
+		m, err = cfg.TopN.Materialized.store(index)
+		if err != nil {
+			return err
+		}
+		// Polling an existing job is a cache lookup, not an interactive search.
+		if cfg.TopN.Materialized.Enabled && poll && api.path != "" {
+			if found, err := onDemandSummaries.lookup(summaryJobKey(m, q, metric), metric); found {
+				return err
+			}
+		}
+	}
 	select {
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
 		return errBudget
 	}
-	q.setSearchVersion(version)
-	q.storeScope = scope
 	if q.selected != nil {
-		return runSelected(ctx, call, index, pred, q, metric, cfg.TopN.RawFrom == "")
+		return runSelected(ctx, call, index, pred, q, metric)
 	}
 	if materialized {
-		m, err := cfg.TopN.Materialized.store(index, from)
-		if err != nil {
-			return err
+		if cfg.TopN.Materialized.Enabled {
+			return readOnDemand(ctx, call, api, m, q, metric, time.Now(), cfg.TopN.Materialized.writes(), poll)
 		}
-		return readMaterialized(ctx, call, pitFor(version), m, q, metric, time.Now())
+		return readMaterialized(ctx, call, api, m, q, metric, time.Now())
 	}
-	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
+	return runQuery(ctx, call, api, index, pred, q, metric)
 }
 
 func withoutJVMStart() dsl {
@@ -626,21 +625,21 @@ func hasMissingJVMStarts(raw json.RawMessage) (bool, error) {
 	return *result.Count > 0, nil
 }
 
-func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric) error {
 	call = budgetedCaller(call, responseLimit)
 	nodeDifference := q.Source == "node_stats" && metric.mode.difference()
 	single := func() error {
 		m := metric
 		m.jvmSummary = nodeDifference
-		err := singleSearch(ctx, call, index, pred, q, m, checkHistory)
+		err := singleSearch(ctx, call, index, pred, q, m)
 		if errors.Is(err, errLegacyJVM) && api.path == "" && ctx.Err() == nil {
 			// The second single search collects all its own evidence, so it need
 			// not share a view with the unsuccessful summary search.
-			return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+			return singleSearch(ctx, call, index, pred, q, metric)
 		}
 		return err
 	}
-	hint, canLearn := nodeRoutingKey(q, metric, api, index, checkHistory)
+	hint, canLearn := nodeRoutingKey(q, metric, api, index)
 	learned := canLearn && pitHints.contains(hint, time.Now())
 	var singleErr error
 	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
@@ -660,7 +659,7 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 				singleErr = single()
 			}
 			if errors.Is(singleErr, errLegacyJVM) {
-				return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+				return singleSearch(ctx, call, index, pred, q, metric)
 			}
 			if !singleFirst {
 				return singleErr
@@ -669,15 +668,6 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 		return err
 	}
 	defer s.close()
-	if checkHistory {
-		covered, err := s.retainedAt(ctx, pred, q.Min)
-		if err != nil {
-			return err
-		}
-		if !covered {
-			return errRawHistory
-		}
-	}
 	if nodeDifference {
 		var raw json.RawMessage
 		if err := s.search(ctx, pred, missingJVMStarts(q), &raw); err != nil {

@@ -34,15 +34,15 @@ func selectEntities(q Query, names string) []string {
 	return selected
 }
 
-func runSelected(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+func runSelected(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
 	call = budgetedCaller(call, responseLimit)
 	if q.Source == "node_stats" && metric.mode.difference() {
 		summary := metric
 		summary.jvmSummary = true
-		err := singleSearch(ctx, call, index, pred, q, summary, checkHistory)
+		err := singleSearch(ctx, call, index, pred, q, summary)
 		if !errors.Is(err, errLegacyJVM) || ctx.Err() != nil {
 			return err
 		}
 	}
-	return singleSearch(ctx, call, index, pred, q, metric, checkHistory)
+	return singleSearch(ctx, call, index, pred, q, metric)
 }

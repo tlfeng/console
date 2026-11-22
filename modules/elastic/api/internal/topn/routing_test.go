@@ -36,7 +36,7 @@ func TestRoutingHintLearnsOnlyFromCandidateLimit(t *testing.T) {
 	q := Query{Source: "node_stats", Cluster: t.Name(), storeScope: "monitor", Min: 1000, Max: 1999, Width: 1, N: 5}
 	metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
 	api := pitFor(elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.16.0"})
-	key, _ := nodeRoutingKey(q, metric, api, "raw", false)
+	key, _ := nodeRoutingKey(q, metric, api, "raw")
 	defer pitHints.forget(key)
 	var calls []string
 	count := 194 // Oversized response, not a valid candidate sentinel.
@@ -68,7 +68,7 @@ func TestRoutingHintLearnsOnlyFromCandidateLimit(t *testing.T) {
 		t.Helper()
 		calls = nil
 		pred, _ := query.filter()
-		if err := runQuery(context.Background(), call, pit, "raw", pred, query, metric, false); err != nil {
+		if err := runQuery(context.Background(), call, pit, "raw", pred, query, metric); err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(calls, want) {

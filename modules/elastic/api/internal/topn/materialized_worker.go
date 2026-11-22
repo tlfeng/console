@@ -46,7 +46,7 @@ func readTransitionBatches(ctx context.Context, s *snapshot, q Query, batches []
 				return nil, errors.New("invalid TopN transition range")
 			}
 			for _, start := range []int64{ts - w, ts} {
-				if start < 0 || (start < first && start < q.rawFrom) {
+				if start < 0 {
 					continue
 				}
 				lo, hi := start, min(q.Max, start+w-1)
@@ -116,64 +116,31 @@ func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializ
 	if !q.AllIndices && len(q.Indices) == 0 {
 		return nil
 	}
-	if q.Max > now.UnixMilli() || !m.covered(q.Min, q.Max) {
+	if q.Max > now.UnixMilli() {
 		return errSummaryHistory
 	}
-	// Keep the newest settled bucket on the raw path for two extra ticks,
-	// allowing the writer to publish and the index to refresh.
-	sealed, edgeSet := materializedScopes(q, now.Add(-materializedLag-2*time.Minute).UnixMilli())
-	if len(edgeSet) > 5 {
-		return errSummaryHistory
-	}
-	w := int64(q.Width) * 1000
-	for _, st := range sealed {
-		if !m.covered(st-w, st+w-1) {
-			return errSummaryHistory
-		}
+	sealed, edges := summaryPlan(m, q, now)
+	if len(edges) > 5 {
+		return errBudget
 	}
 	call = budgetedCaller(call, responseLimit)
-	var all []scoreBucket
-	if len(sealed) > 0 {
-		s, err := open(ctx, call, m.index, api)
-		if err != nil {
-			return err
-		}
-		defer s.close()
-		all, err = readMetricScoreBuckets(ctx, s, q, m, metric.Item.Key, sealed)
-		if err != nil {
-			return err
-		}
+	all, err := loadSummaries(ctx, call, api, m, q, metric, sealed)
+	if err != nil {
+		return err
 	}
-	if len(edgeSet) > 0 {
-		starts := make([]int64, 0, len(edgeSet))
-		for st := q.Min / w * w; st <= q.Max; st += w {
-			if edgeSet[st] {
-				starts = append(starts, st)
-			}
-		}
-		for _, st := range starts {
-			lo := st - w
-			if lo < q.Min {
-				lo = max(q.Min, lo)
-				if q.Min/w*w-w >= q.rawFrom && st == q.Min/w*w {
-					lo = q.Min/w*w - w
-				}
-			}
-			if !m.covered(lo, min(st+w-1, q.Max)) {
-				return errSummaryHistory
-			}
-		}
+	if len(edges) > 0 {
 		s, err := open(ctx, call, m.raw, api)
 		if err != nil {
 			return err
 		}
 		defer s.close()
-		edges, err := readTransitions(ctx, s, q, metric, starts)
+		scores, err := readTransitions(ctx, s, q, metric, edges)
 		if err != nil {
 			return err
 		}
-		all = append(all, edges...)
+		all = append(all, scores...)
 	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -279,8 +246,8 @@ func materializedTick(ctx context.Context, call caller, api pitAPI, m materializ
 		for _, width := range []int{10800, 14400, 21600, 28800} {
 			w := int64(width) * 1000
 			end := now.Add(-materializedLag).UnixMilli() / w * w
-			begin := max(now.AddDate(0, 0, -materializedDays).UnixMilli()/w*w, (m.from+w-1)/w*w+w)
-			q := Query{Cluster: cluster, Source: "index_stats", Width: width, AllIndices: true, rawFrom: m.from}
+			begin := max(now.AddDate(0, 0, -materializedDays).UnixMilli()/w*w, w)
+			q := Query{Cluster: cluster, Source: "index_stats", Width: width, AllIndices: true}
 			var starts []int64
 			for st := end - w; st >= begin; st -= w {
 				if m.covered(st-w, st+w-1) {
@@ -329,7 +296,7 @@ func materializedTick(ctx context.Context, call caller, api pitAPI, m materializ
 
 func StartMaterialized() {
 	var cfg config
-	if _, err := env.ParseConfig("insight", &cfg); err != nil || !cfg.TopN.Materialized.Writer || len(cfg.TopN.Materialized.Clusters) == 0 {
+	if _, err := env.ParseConfig("insight", &cfg); err != nil || !cfg.TopN.Materialized.writes() || (!cfg.TopN.Materialized.Enabled && len(cfg.TopN.Materialized.Clusters) == 0) {
 		return
 	}
 	if len(cfg.TopN.Materialized.Clusters) > 4 {
@@ -339,14 +306,18 @@ func StartMaterialized() {
 	task.RegisterScheduleTask(task.ScheduleTask{ID: materializedTask, Interval: "1m", Singleton: true, Task: func(ctx context.Context) {
 		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
-		index, from, err := cfg.rawSource()
+		index, err := cfg.rawSource()
 		if err == nil {
 			var m materializedStore
-			m, err = cfg.TopN.Materialized.store(index, from)
+			m, err = cfg.TopN.Materialized.store(index)
 			if err == nil {
 				call, version, _ := monitoredStore()
 				if call == nil {
 					err = errUnavailable
+				} else if cfg.TopN.Materialized.Enabled {
+					if pitFor(version).path != "" {
+						err = ensureSummaryIndex(ctx, budgetedCaller(call, responseLimit), m)
+					}
 				} else {
 					err = materializedTick(ctx, call, pitFor(version), m, cfg.TopN.Materialized.Clusters, cfg.TopN.Materialized.metricKeys(), time.Now().UTC())
 				}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -93,15 +92,6 @@ func TestEasysearchSnapshot(t *testing.T) {
 	if !ok {
 		t.Fatal("valid permissions rejected")
 	}
-	for _, tc := range []struct {
-		boundary int64
-		want     bool
-	}{{q.Min, true}, {q.Min - 1, false}} {
-		got, err := s.retainedAt(ctx, pred, tc.boundary)
-		if err != nil || got != tc.want {
-			t.Fatalf("retainedAt(%d) = %v, %v; want %v", tc.boundary, got, err, tc.want)
-		}
-	}
 
 	m := Metric{Item: &common.MetricItem{Key: "index_storage"}, Field: "metric"}
 	if err := peaks(ctx, s, q, pred, m); err != nil {
@@ -112,7 +102,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 	}
 	single := Metric{Item: &common.MetricItem{Key: "index_storage"}, Field: "metric"}
 	pred, _ = q.filter()
-	if err := singleSearch(ctx, call, alias, pred, q, single, true); err != nil {
+	if err := singleSearch(ctx, call, alias, pred, q, single); err != nil {
 		t.Fatal(err)
 	}
 	if len(single.Item.Lines) != 1 || single.Item.Lines[0].Metric.Label != "b" || !reflect.DeepEqual(single.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 1000), 50.0}, {int64(epoch + 2000), 999.0}}) {
@@ -134,7 +124,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 		pred, _ := base.filter()
 		auto := makeMetric()
-		if err := runQuery(ctx, call, pitFor(elastic.Version{Distribution: elastic.Easysearch}), alias, pred, base, auto, true); err != nil {
+		if err := runQuery(ctx, call, pitFor(elastic.Version{Distribution: elastic.Easysearch}), alias, pred, base, auto); err != nil {
 			t.Fatal(err)
 		}
 		if len(auto.Item.Lines) != 2 || auto.Item.Lines[0].Metric.Label != "b" {
@@ -144,7 +134,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		base.N = 1 // Must not truncate the selected curves.
 		pred, _ = base.filter()
 		manual := makeMetric()
-		if err := singleSearch(ctx, call, alias, pred, base, manual, true); err != nil {
+		if err := singleSearch(ctx, call, alias, pred, base, manual); err != nil {
 			t.Fatal(err)
 		}
 		if len(manual.Item.Lines) != 2 || manual.Item.Lines[0].Metric.Label != "a" || manual.Item.Lines[1].Metric.Label != "b" {
@@ -186,7 +176,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 
 	pred, _ = q.filter()
 	single = Metric{Item: &common.MetricItem{Key: "query_times"}, Field: "metric", mode: rate}
-	if err := singleSearch(ctx, call, alias, pred, q, single, false); err != nil {
+	if err := singleSearch(ctx, call, alias, pred, q, single); err != nil {
 		t.Fatal(err)
 	}
 	if len(single.Item.Lines) != len(m.Item.Lines) || single.Item.Lines[0].Metric.Label != m.Item.Lines[0].Metric.Label || !reflect.DeepEqual(single.Item.Lines[0].Data, m.Item.Lines[0].Data) {
@@ -215,7 +205,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			err = paged(ctx, snap, q, pred, disk)
 			snap.close()
 		} else {
-			err = singleSearch(ctx, call, alias, pred, q, disk, false)
+			err = singleSearch(ctx, call, alias, pred, q, disk)
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -241,14 +231,14 @@ func TestEasysearchSnapshot(t *testing.T) {
 			}
 			auto, manual := makeMetric(), makeMetric()
 			pred, _ := q.filter()
-			if err := singleSearch(ctx, call, alias, pred, q, auto, false); err != nil {
+			if err := singleSearch(ctx, call, alias, pred, q, auto); err != nil {
 				t.Fatal(err)
 			}
 			selected := q
 			selected.N = 1
 			selected.selected = selectEntities(q, "full,small,missing,full")
 			pred, _ = selected.filter()
-			if err := runSelected(ctx, call, alias, pred, selected, manual, false); err != nil {
+			if err := runSelected(ctx, call, alias, pred, selected, manual); err != nil {
 				t.Fatal(err)
 			}
 			if len(manual.Item.Lines) != 2 {
@@ -299,7 +289,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 					selected.selected = selectEntities(selected, "n1")
 					metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
 					pred, _ := selected.filter()
-					if err := runSelected(ctx, call, alias, pred, selected, metric, false); err != nil {
+					if err := runSelected(ctx, call, alias, pred, selected, metric); err != nil {
 						t.Fatal(err)
 					}
 					if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
@@ -312,7 +302,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 						if usePIT {
 							api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 						}
-						if err := runQuery(ctx, call, api, alias, pred, restart, metric, false); err != nil {
+						if err := runQuery(ctx, call, api, alias, pred, restart, metric); err != nil {
 							t.Fatal(err)
 						}
 						if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
@@ -334,7 +324,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 				if usePIT {
 					api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 				}
-				if err := runQuery(ctx, call, api, alias, pred, q, metric, true); err != nil {
+				if err := runQuery(ctx, call, api, alias, pred, q, metric); err != nil {
 					t.Fatalf("seconds=%d PIT=%v: optional pre-read must not cause history rejection: %v", tc.seconds, usePIT, err)
 				}
 				if len(metric.Item.Lines) != 0 {
@@ -369,7 +359,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			if usePIT {
 				api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 			}
-			if err := runQuery(ctx, call, api, historyAlias, pred, q, metric, true); err != nil {
+			if err := runQuery(ctx, call, api, historyAlias, pred, q, metric); err != nil {
 				return "", err
 			}
 			if len(metric.Item.Lines) == 0 {
@@ -382,18 +372,28 @@ func TestEasysearchSnapshot(t *testing.T) {
 				t.Fatalf("PIT=%v complete history: got %q, %v", usePIT, got, err)
 			}
 		}
-		// A window ending before the first sample still rejects.
-		if _, err := search(false, epoch-1000); !errors.Is(err, errRawHistory) {
-			t.Fatalf("window predating raw evidence: got %v", err)
+		for _, usePIT := range []bool{false, true} {
+			if got, err := search(usePIT, epoch-1000); err != nil || got != "middle" {
+				t.Fatalf("missing beginning must not reject retained rows: %s %v", got, err)
+			}
+		}
+		for _, engine := range []pitAPI{{}, pitFor(elastic.Version{Distribution: elastic.Easysearch})} {
+			empty := window
+			empty.Min, empty.Max = epoch-3000, epoch-1000
+			pred, _ := empty.filter()
+			metric := Metric{Item: &common.MetricItem{Key: "index_storage"}, Field: "metric"}
+			if err := runQuery(ctx, call, engine, historyAlias, pred, empty, metric); err != nil || len(metric.Item.Lines) != 0 {
+				t.Fatalf("complete empty window: %v %v", err, metric.Item.Lines)
+			}
 		}
 		must("POST", "/_aliases", dsl{"actions": []dsl{{"remove": dsl{"index": backing[1], "alias": historyAlias}}}})
 		for _, usePIT := range []bool{false, true} {
-			// Characterize the current false acceptance of a window with a gap.
+			// Rank the retained observations, not the removed backing index.
 			if got, err := search(usePIT, window.Min); err != nil || got != "new" {
 				t.Fatalf("PIT=%v gap behavior changed; re-evaluate this known-issue fixture: got %q, %v", usePIT, got, err)
 			}
 		}
-		t.Log("reproduced: earlier raw data makes both paths accept a window whose missing middle backing index contained the winner")
+		t.Log("both paths rank retained observations after the middle backing index is removed")
 	})
 
 }
@@ -476,7 +476,7 @@ func TestElasticsearch68SingleSearch(t *testing.T) {
 		if !ok {
 			t.Fatal(tc.key)
 		}
-		if err := runQuery(ctx, call, pitFor(version), index, pred, q, metric, true); err != nil {
+		if err := runQuery(ctx, call, pitFor(version), index, pred, q, metric); err != nil {
 			t.Fatal(err)
 		}
 		lines := metric.Item.Lines

@@ -80,7 +80,8 @@ func TestTopNMaterializedMetricCoverage(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(missing, map[string][]int64{queryRateKey: {2000}}) {
 		t.Fatalf("%v %v", missing, err)
 	}
-	c := materializedConfig{Read: true, Clusters: []string{"biz"}}
+	yes := true
+	c := materializedConfig{ReadOverride: &yes, Clusters: []string{"biz"}}
 	if !c.enabled("biz", writeRateKey) || c.enabled("biz", queryRateKey) {
 		t.Fatal("old config must only read write-rate")
 	}

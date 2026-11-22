@@ -13,16 +13,17 @@ import (
 func TestSingleSearchCompleteOrReject(t *testing.T) {
 	q := Query{Source: "node_stats", Min: 1000, Max: 1999, Width: 1, N: 2}
 	for _, tc := range []struct {
-		name            string
-		count, coverage int
-		partial         bool
-		want            error
+		name    string
+		count   int
+		rollup  bool
+		partial bool
+		want    error
 	}{
-		{name: "complete at limit", count: 192, coverage: 1},
-		{name: "empty", coverage: 1},
-		{name: "sentinel", count: 193, coverage: 1, want: errCandidateLimit},
-		{name: "history unavailable", count: 1, want: errRawHistory},
-		{name: "partial shards", count: 1, coverage: 1, partial: true, want: errors.New("incomplete monitoring search")},
+		{name: "complete at limit", count: 192},
+		{name: "empty"},
+		{name: "sentinel", count: 193, want: errCandidateLimit},
+		{name: "reject rollup", count: 1, rollup: true, want: errRawHistory},
+		{name: "partial shards", count: 1, partial: true, want: errors.New("incomplete monitoring search")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
@@ -39,11 +40,14 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 				if tc.partial {
 					shards = `"_shards":{"total":3,"successful":2,"failed":0}`
 				}
-				return []byte(fmt.Sprintf(`{%s,"timed_out":false,"aggregations":{"coverage":{"doc_count":%d},"scan":{"entities":{"buckets":[%s]}}}}`, shards, tc.coverage, strings.Join(entities, ","))), nil
+				if tc.rollup {
+					shards += `,"origin":"rollup"`
+				}
+				return []byte(fmt.Sprintf(`{%s,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[%s]}}}}`, shards, strings.Join(entities, ","))), nil
 			}
 			pred, _ := q.filter()
 			metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
-			err := singleSearch(context.Background(), call, "raw", pred, q, metric, true)
+			err := singleSearch(context.Background(), call, "raw", pred, q, metric)
 			if calls != 1 {
 				t.Fatalf("got %d requests", calls)
 			}
@@ -56,7 +60,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 			if err != nil || len(metric.Item.Lines) != min(q.N, tc.count) {
 				t.Fatalf("error=%v lines=%v", err, metric.Item.Lines)
 			}
-			if tc.count != 0 && (metric.Item.Lines[0].Metric.Label != "node-000" || metric.Item.Lines[1].Metric.Label != "node-001") {
+			if tc.count >= 2 && (metric.Item.Lines[0].Metric.Label != "node-000" || metric.Item.Lines[1].Metric.Label != "node-001") {
 				t.Fatal("zero scores were dropped or ties were reordered")
 			}
 		})

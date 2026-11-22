@@ -30,6 +30,9 @@ var materializedMetrics = map[string]materializedDefinition{
 
 func (c materializedConfig) metricKeys() []string {
 	if len(c.Metrics) == 0 {
+		if c.Enabled {
+			return []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey}
+		}
 		return []string{writeRateKey}
 	}
 	return c.Metrics

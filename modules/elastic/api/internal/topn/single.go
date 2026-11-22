@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric, checkHistory bool) error {
+func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
 	budget := 5998 // Reserve the scan and history filter buckets.
 	if metric.jvmSummary {
 		budget-- // The same-search JVM availability filter.
@@ -29,9 +29,6 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	aggs := dsl{"scan": dsl{"filter": metricScope(q, metric), "aggs": dsl{"entities": dsl{
 		"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))},
 	}}}}
-	if checkHistory {
-		aggs["coverage"] = dsl{"filter": filterRange(0, q.Min)}
-	}
 	if metric.jvmSummary {
 		// Check availability in the same read as the data, not in a separate live search.
 		aggs["missing_jvm_start"] = missingJVMStarts(q)
@@ -61,17 +58,6 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	}
 	if !response.complete() {
 		return errors.New("incomplete monitoring search")
-	}
-	if checkHistory {
-		var coverage struct {
-			Count *int64 `json:"doc_count"`
-		}
-		if err := json.Unmarshal(response.Aggs["coverage"], &coverage); err != nil {
-			return err
-		}
-		if coverage.Count == nil || *coverage.Count == 0 {
-			return errRawHistory
-		}
 	}
 	if metric.jvmSummary {
 		missing, err := hasMissingJVMStarts(response.Aggs["missing_jvm_start"])
