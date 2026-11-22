@@ -75,6 +75,19 @@ metrics:
     node_stats: true
     index_stats: true
 
+# Optional long-window indexing-rate TopN. Provision the dedicated summary
+# index before enabling; see modules/elastic/api/internal/topn/README.md.
+# insight:
+#   topn:
+#     raw_from: "2026-01-01T00:00:00Z" # replace with verified coverage
+#     materialized:
+#       index: .console-topn-index-rate-v1
+#       writer: false # enable on only one Console replica
+#       read: false # enable after backfill
+#       clusters: []
+#       metrics: [indexing_rate, query_times, indexing_latency, query_latency]
+#       read_metrics: [indexing_rate] # expand after backfill
+
 ## badger kv storage configuration
 badger:
   enabled: true

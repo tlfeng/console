@@ -29,6 +29,7 @@ import (
 	_ "expvar"
 	"fmt"
 	api3 "infini.sh/console/modules/agent/api"
+	elasticAPI "infini.sh/console/modules/elastic/api"
 	"infini.sh/console/plugin/api/email"
 	"infini.sh/console/plugin/audit_log"
 	"infini.sh/framework/core/api"
@@ -183,6 +184,8 @@ func main() {
 					v.Value.Start()
 				}
 			}
+
+			elasticAPI.StartTopNMaterialization()
 
 			task1.RunWithinGroup("initialize_alerting", func(ctx context.Context) error {
 				err := alerting2.InitTasks()

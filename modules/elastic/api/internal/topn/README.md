@@ -23,6 +23,45 @@ All paths score and draw from the same validated points. Zero is valid when meas
 
 The initial limits are deliberately conservative: 512 visible time buckets, four concurrent exact requests per Console process, up to 32 storage shards per PIT, a five-second query deadline (or a shorter requested timeout), and 24 MiB of cumulative decoded response data across the single attempt and PIT requests. Composite scans also stop at 48 search pages (including a possible terminal probe) or 150,000 entity-time buckets. The page size is reduced for wider windows. The decoded response is bounded while reading. PIT deletion has an independent two-second deadline and a small separate response cap; short PIT expiry is the fallback if the latest ID is not available. These are protections, not production performance guarantees. Budget rejection discards any partial ranking and suggests a shorter window, a larger interval, or manual selection. A complete empty result still renders as an empty chart. Agent, manual selection, and `doc_percent` retain their existing paths.
 
+## Materialized long-window index counters
+
+Default is off. First provision a dedicated concrete index on the **system monitoring store** (not on the monitored cluster). It needs `_source`, an enabled refresh interval, and a retention policy independent of the metrics rollup. Do not use an alias or attach the metrics rollup/ILM template:
+
+```json
+PUT /.console-topn-index-rate-v1
+{
+  "mappings": {
+    "dynamic": false,
+    "_meta": { "console_topn": 1 },
+    "properties": { "t": { "type": "date", "format": "epoch_millis" } }
+  }
+}
+```
+
+Enable **exactly one** writer replica. `Singleton` only prevents overlap within one Console process; this is not HA leader election. For a staged rollout, start the writer without serving the materialized path (`read: false`); enable reads on the desired replicas once coverage is ready. Restart after configuration changes.
+
+```yaml
+insight:
+  topn:
+    raw_from: "2026-01-01T00:00:00Z" # replace with the verified raw coverage start
+    materialized:
+      index: .console-topn-index-rate-v1
+      writer: true # false on every other replica
+      read: false # enable when the target windows have coverage
+      clusters: ["actual-monitoring-cluster-id"]
+      metrics: [indexing_rate, query_times, indexing_latency, query_latency]
+      read_metrics: [indexing_rate] # expand after the new metrics are covered
+      # Optional known unavailable raw ranges, end exclusive:
+      # raw_gaps:
+      #   - { from: "2026-01-10T00:00:00Z", until: "2026-01-11T00:00:00Z" }
+```
+
+When `metrics` is omitted only `indexing_rate` is materialized, preserving existing configurations and summary IDs. `read_metrics` defaults to `metrics` and may be restricted during rollout. All enabled metrics share a raw scan and identity/topology evidence, but coverage, scores and ranking are independent per metric.
+
+The writer checks coverage each minute and backfills up to eight missing buckets per width and cluster per tick, within a shared deadline and response budget. It keeps the most recent 32 days eligible for backfill. Each sealed bucket is created with a deterministic ID only after a complete raw PIT scan. The document stores all valid entity scores, not a local TopN. The reader filters candidates by the caller's index ACL, ranks the entire window, and outputs only winners. Partial boundaries, the transition after a partial first bucket, and the most recent unsealed points are computed from raw data; neither window bounds nor chart widths are rounded. A missing required summary fails explicitly. Short windows, hand selection and other metrics retain their existing paths.
+
+The 15-minute settle lag accommodates timely late arrivals; readers leave a further two-minute publication margin. Sealed documents are immutable: corrections arriving beyond the settle lag are **not** automatically repaired in this version. To repair, rebuild into a separately provisioned summary index and switch the reader once verified. Do not claim a complete raw interval unless retention has been verified; declare known holes. Processed empty buckets are valid, so the summary cannot independently prove completeness of the original collection. Keep raw data for any request boundary being served. Configure an operator-run retention job to delete summary documents with `t` older than the supported history plus margin (e.g. 35 days); this task never deletes user data. The summary requires an engine with strict PIT support and does not raise interactive query limits.
+
 Run `go test ./modules/elastic/api/...` with a compatible Framework checkout. The opt-in snapshot integration test requires a disposable Easysearch instance at `127.0.0.1:19219` named `console-topn-local-bench`; run `CONSOLE_TOPN_INTEGRATION=1 go test ./modules/elastic/api/internal/topn -count=1`. Test fixtures use a newly named temporary index and do not target existing monitoring data.
 
 Elasticsearch 6.8–7.1 uses `interval` for fixed-second date buckets; Elasticsearch 7.2 and newer use `fixed_interval`. The 6.8 compatibility integration test runs against a disposable Elasticsearch instance named `console-topn-local-bench` on `127.0.0.1:19220`: `CONSOLE_TOPN_ES68_INTEGRATION=1 go test ./modules/elastic/api/internal/topn -run TestElasticsearch68SingleSearch -count=1`.

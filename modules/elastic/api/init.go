@@ -25,10 +25,15 @@ package api
 
 import (
 	"infini.sh/console/core/security/enum"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	"infini.sh/framework/core/api"
 )
 
 var clusterAPI APIHandler
+
+func StartTopNMaterialization() {
+	topn.StartMaterialized()
+}
 
 func init() {
 	clusterAPI = APIHandler{}

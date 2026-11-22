@@ -1,4 +1,5 @@
 export default {
+  "cluster.metrics.topn.summary_unavailable": "The index metric summary does not cover this time range. Choose another range or select indices manually.",
   "cluster.metrics.topn.history_unavailable": "Original monitoring data cannot be verified for this window. Choose a more recent window or select an index or node.",
   "cluster.metrics.topn.budget_exceeded": "Automatic TopN exceeded its query limit. Shorten the time range, use a larger interval, or select an index or node.",
   "cluster.metrics.topn.timed_out": "Automatic TopN timed out. Shorten the time range, use a larger interval, or select an index or node.",

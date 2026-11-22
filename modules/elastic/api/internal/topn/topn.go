@@ -31,8 +31,9 @@ var (
 
 type config struct {
 	TopN struct {
-		RawIndex string `config:"raw_index"`
-		RawFrom  string `config:"raw_from"`
+		RawIndex     string             `config:"raw_index"`
+		RawFrom      string             `config:"raw_from"`
+		Materialized materializedConfig `config:"materialized"`
 	} `config:"topn"`
 }
 
@@ -496,6 +497,8 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 
 func failureStatus(err error) string {
 	switch {
+	case errors.Is(err, errSummaryHistory):
+		return "summary_unavailable"
 	case errors.Is(err, errRawHistory):
 		return "history_unavailable"
 	case errors.Is(err, errBudget):
@@ -514,15 +517,7 @@ func WriteStatus(w http.ResponseWriter, status string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"topn_status": status})
 }
 
-func calculate(ctx context.Context, q Query, metric Metric) error {
-	var cfg config
-	if _, err := env.ParseConfig("insight", &cfg); err != nil {
-		return errUnavailable
-	}
-	pred, ok := q.filter()
-	if !ok {
-		return errUnavailable
-	}
+func (cfg config) rawSource() (string, int64, error) {
 	index := cfg.TopN.RawIndex
 	if index == "" {
 		// Use the original write alias, not the legacy search wildcard that
@@ -530,15 +525,39 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 		index = orm.GetIndexName(event.Event{})
 	}
 	if !rawName.MatchString(index) || index == "_all" {
+		return "", 0, errRawHistory
+	}
+	if cfg.TopN.RawFrom == "" {
+		return index, 0, nil
+	}
+	from, err := parseTime(cfg.TopN.RawFrom)
+	if err != nil || from < 0 {
+		return "", 0, errRawHistory
+	}
+	return index, from, nil
+}
+
+func calculate(ctx context.Context, q Query, metric Metric) error {
+	var cfg config
+	if _, err := env.ParseConfig("insight", &cfg); err != nil {
+		return errUnavailable
+	}
+	materialized := useMaterialized(q, metric) && cfg.TopN.Materialized.enabled(q.Cluster, metric.Item.Key)
+	if materialized && !q.AllIndices && len(q.Indices) == 0 {
+		return nil
+	}
+	pred, ok := q.filter()
+	if !ok {
+		return errUnavailable
+	}
+	index, from, err := cfg.rawSource()
+	if err != nil {
+		return err
+	}
+	if q.Min < from {
 		return errRawHistory
 	}
-	if cfg.TopN.RawFrom != "" {
-		from, err := parseTime(cfg.TopN.RawFrom)
-		if err != nil || from < 0 || q.Min < from {
-			return errRawHistory
-		}
-		q.rawFrom = from
-	}
+	q.rawFrom = from
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
 		return errBudget
 	}
@@ -554,6 +573,13 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	}
 	q.setSearchVersion(version)
 	q.storeScope = scope
+	if materialized {
+		m, err := cfg.TopN.Materialized.store(index, from)
+		if err != nil {
+			return err
+		}
+		return readMaterialized(ctx, call, pitFor(version), m, q, metric, time.Now())
+	}
 	return runQuery(ctx, call, pitFor(version), index, pred, q, metric, cfg.TopN.RawFrom == "")
 }
 

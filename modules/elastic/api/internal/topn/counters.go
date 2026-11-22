@@ -15,11 +15,13 @@ type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time  *int64  `json:"key"`
-	Count int     `json:"doc_count"`
-	Value *scalar `json:"value"`
-	Other *scalar `json:"other"`
-	Ratio *struct {
+	Time   *int64  `json:"key"`
+	Count  int     `json:"doc_count"`
+	Value  *scalar `json:"value"`
+	Other  *scalar `json:"other"`
+	Extra1 *scalar `json:"extra1"`
+	Extra2 *scalar `json:"extra2"`
+	Ratio  *struct {
 		Hits struct {
 			Rows []struct {
 				Fields map[string][]float64 `json:"fields"`
@@ -251,11 +253,32 @@ func keepWinner(best []winner, candidate winner, n int) []winner {
 }
 
 func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
-	pred["filter"] = append(pred["filter"].([]dsl), metricScope(q, metric))
-	buckets := metricAggs(q, metric)
+	best := make([]winner, 0, q.N)
+	err := visitCounterBuckets(ctx, s, q, pred, metric, metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples) error {
+		candidate, err := scoreSeries(q, metric, name, points)
+		if err == nil {
+			best = keepWinner(best, candidate, q.N)
+		}
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for _, row := range best {
+		display(q, metric, row.name, row.points)
+	}
+	return nil
+}
+
+func visitCounterBuckets(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric, scope dsl, cost int, visit func(string, []samples) error) error {
+	return visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), scope, cost, visit)
+}
+
+func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost int, visit func(string, []samples) error) error {
+	pred["filter"] = append(pred["filter"].([]dsl), scope)
 	size := pageSize
 	// Leave headroom for per-point identity buckets plus their histogram parents.
-	if limit := 6000 / (metricBucketCost(q, metric) + 1); limit < size {
+	if limit := 6000 / (cost + 1); limit < size {
 		size = limit
 	}
 	if size < 1 {
@@ -263,7 +286,6 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	}
 	composite := dsl{"size": size, "sources": []dsl{{"entity": dsl{"terms": dsl{"field": q.entity()}}}}}
 	agg := dsl{"composite": composite, "aggs": dsl{"dates": q.histogram(buckets)}}
-	best := make([]winner, 0, q.N)
 	allowed := q.authorizer()
 	var after, last string
 	total := 0
@@ -300,18 +322,13 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 			if total > maxPoints {
 				return errBudget
 			}
-			candidate, err := scoreSeries(q, metric, name, b.Dates.Buckets)
-			if err != nil {
+			if err := visit(name, b.Dates.Buckets); err != nil {
 				return err
 			}
-			best = keepWinner(best, candidate, q.N)
 		}
 		if len(response.Buckets) == 0 || response.After == nil {
 			if len(response.Buckets) == size && response.After == nil {
 				return errors.New("missing TopN cursor")
-			}
-			for _, row := range best {
-				display(q, metric, row.name, row.points)
 			}
 			return nil
 		}
