@@ -23,8 +23,8 @@ func latencyHit(fields dsl) dsl {
 }
 
 func TestCounterPoint(t *testing.T) {
-	previous := parseSample(t, `{"key":1000,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"value":{"value":40},"pair":{"hits":{"hits":[{"fields":{"elapsed":[40],"ops":[5]}}]}},"jvm_start_count":{"value":1},"jvm_start_min":{"value":10000},"jvm_start_max":{"value":10000}}`)
-	current := parseSample(t, `{"key":2000,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"value":{"value":60},"pair":{"hits":{"hits":[{"fields":{"elapsed":[60],"ops":[7]}}]}},"jvm_start_count":{"value":1},"jvm_start_min":{"value":10100},"jvm_start_max":{"value":10100}}`)
+	previous := parseSample(t, `{"key":1000,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"value":{"value":40},"pair":{"hits":{"hits":[{"fields":{"elapsed":[40],"ops":[5]}}]}}}`)
+	current := parseSample(t, `{"key":2000,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"value":{"value":60},"pair":{"hits":{"hits":[{"fields":{"elapsed":[60],"ops":[7]}}]}}}`)
 	paired := Metric{mode: latency, Field: "elapsed", Field2: "ops"}
 	rateMetric := Metric{mode: rate}
 	if score, ok, err := counterPoint(previous, current, 1000, paired, true); err != nil || !ok || score != 10 {
@@ -32,11 +32,6 @@ func TestCounterPoint(t *testing.T) {
 	}
 	if _, ok, err := counterPoint(previous, current, 2000, rateMetric, false); ok || err != nil {
 		t.Fatal("gap produced a point or error")
-	}
-	truncated := current
-	truncated.Count = 2
-	if sameJVMLifetime(previous, truncated) || sameJVMLifetime(truncated, current) {
-		t.Fatal("truncated JVM evidence must invalidate both neighboring differences")
 	}
 
 	missing := current
@@ -50,10 +45,6 @@ func TestCounterPoint(t *testing.T) {
 		if _, ok, err := counterPoint(previous, current, 1000, paired, true); ok || err != nil {
 			t.Fatal("missing, multivalued, or unchanged operations produced a latency point")
 		}
-	}
-	*current.JVMMin.Value, *current.JVMMax.Value = 20000, 20000
-	if _, ok, err := counterPoint(previous, current, 1000, rateMetric, true); ok || err != nil {
-		t.Fatal("process restart produced a rate")
 	}
 	current.Value = &scalar{Value: new(float64)}
 	if _, ok, err := counterPoint(previous, current, 1000, rateMetric, false); ok || err != nil {
@@ -92,25 +83,6 @@ func TestCompositePageFailureDoesNotPublish(t *testing.T) {
 		if err == nil || (cancelSecond && !errors.Is(err, context.Canceled)) || calls != 2 || len(m.Item.Lines) != 0 {
 			t.Fatalf("err=%v calls=%d lines=%d", err, calls, len(m.Item.Lines))
 		}
-	}
-}
-
-func TestMixedJVMLifetime(t *testing.T) {
-	const summary = `"doc_count":70,"jvm_start_min":{"value":10000},"jvm_start_max":{"value":10050},"jvm_start_count":{"value":69},`
-	for _, tc := range []struct {
-		name   string
-		legacy string
-		start  int64
-	}{
-		{"one legacy sample with 69 summarized", `"jvm_legacy":{"doc_count":1,"jvm_lifetime":{"hits":{"hits":[{"fields":{"` + jvmTimestamp + `":[11000],"` + jvmUptime + `":[900]}}]}}}`, 10000},
-		{"missing legacy sample", `"jvm_legacy":{"doc_count":1,"jvm_lifetime":{"hits":{"hits":[]}}}`, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, hi, ok := parseSample(t, "{"+summary+tc.legacy+"}").jvmLifetime()
-			if got != tc.start || ok != (tc.start != 0) || (ok && hi != 10100) {
-				t.Fatalf("got %d..%d valid=%v", got, hi, ok)
-			}
-		})
 	}
 }
 

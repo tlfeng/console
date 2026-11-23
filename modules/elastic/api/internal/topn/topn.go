@@ -26,7 +26,6 @@ import (
 var (
 	errBudget         = errors.New("automatic TopN budget exceeded")
 	errCandidateLimit = fmt.Errorf("single search candidate limit: %w", errBudget)
-	errLegacyJVM      = errors.New("some node samples still require individual JVM evidence")
 	errRawHistory     = errors.New("automatic TopN raw history unavailable")
 )
 
@@ -623,46 +622,13 @@ func calculateWithConfig(ctx context.Context, q Query, metric Metric, poll bool,
 	return runQuery(ctx, call, api, index, pred, q, metric)
 }
 
-func withoutJVMStart() dsl {
-	return dsl{"bool": dsl{"must_not": []dsl{{"range": dsl{jvmStart: dsl{"gt": 0}}}}}}
-}
-
-func missingJVMStarts(q Query) dsl {
-	return dsl{"filter": dsl{"bool": dsl{"filter": []dsl{q.counterScope(), withoutJVMStart()}}}}
-}
-
-func hasMissingJVMStarts(raw json.RawMessage) (bool, error) {
-	var result struct {
-		Count *int64 `json:"doc_count"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return false, err
-	}
-	if result.Count == nil {
-		return false, errors.New("missing JVM evidence count")
-	}
-	return *result.Count > 0, nil
-}
-
 func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric) error {
-	nodeDifference := q.Source == "node_stats" && metric.mode.difference()
-	single := func() error {
-		m := metric
-		m.jvmSummary = nodeDifference
-		err := singleSearch(ctx, call, index, pred, q, m)
-		if errors.Is(err, errLegacyJVM) && api.path == "" && ctx.Err() == nil {
-			// The second single search collects all its own evidence, so it need
-			// not share a view with the unsuccessful summary search.
-			return singleSearch(ctx, call, index, pred, q, metric)
-		}
-		return err
-	}
 	hint, canLearn := nodeRoutingKey(q, metric, api, index)
 	learned := canLearn && pitHints.contains(hint, time.Now())
 	var singleErr error
 	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
 	if singleFirst {
-		singleErr = single()
+		singleErr = singleSearch(ctx, call, index, pred, q, metric)
 		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
 			return singleErr
 		}
@@ -672,31 +638,12 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 		if learned {
 			pitHints.forget(hint)
 		}
-		if ctx.Err() == nil {
-			if !singleFirst {
-				singleErr = single()
-			}
-			if errors.Is(singleErr, errLegacyJVM) {
-				return singleSearch(ctx, call, index, pred, q, metric)
-			}
-			if !singleFirst {
-				return singleErr
-			}
+		if ctx.Err() == nil && !singleFirst {
+			return singleSearch(ctx, call, index, pred, q, metric)
 		}
 		return err
 	}
 	defer s.close()
-	if nodeDifference {
-		var raw json.RawMessage
-		if err := s.search(ctx, pred, missingJVMStarts(q), &raw); err != nil {
-			return err
-		}
-		missing, err := hasMissingJVMStarts(raw)
-		if err != nil {
-			return err
-		}
-		metric.jvmSummary = !missing
-	}
 	if metric.mode != peak {
 		err = paged(ctx, s, q, pred, metric)
 	} else {

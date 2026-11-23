@@ -48,7 +48,6 @@ import (
 
 type APIHandler struct {
 	core.Handler
-	Config common.ModuleConfig
 }
 
 func (h *APIHandler) Client() elastic.API {

@@ -23,29 +23,14 @@ type samples struct {
 	Other      *scalar    `json:"other"`
 	Pair       *pairedHit `json:"pair"`
 	SecondPair *pairedHit `json:"second_pair"`
-	JVMLegacy  *struct {
-		Count int      `json:"doc_count"`
-		JVM   *jvmHits `json:"jvm_lifetime"`
-	} `json:"jvm_legacy"`
-	JVMMin   *scalar `json:"jvm_start_min"`
-	JVMMax   *scalar `json:"jvm_start_max"`
-	JVMCount *scalar `json:"jvm_start_count"`
-	Shards   *scalar `json:"shards"`
-	Replicas *scalar `json:"replicas"`
-	Identity *struct {
+	Shards     *scalar    `json:"shards"`
+	Replicas   *scalar    `json:"replicas"`
+	Identity   *struct {
 		Buckets []struct {
 			Key   string `json:"key"`
 			Count int    `json:"doc_count"`
 		} `json:"buckets"`
 	} `json:"identity"`
-}
-
-type jvmHits struct {
-	Hits struct {
-		Rows []struct {
-			Fields map[string][]int64 `json:"fields"`
-		} `json:"hits"`
-	} `json:"hits"`
 }
 
 func (p samples) entity() string {
@@ -91,9 +76,6 @@ func counterPoint(previous, current samples, width int64, metric Metric, node bo
 	if id == "" || id != current.entity() {
 		return 0, false, nil
 	}
-	if node && !sameJVMLifetime(previous, current) {
-		return 0, false, nil
-	}
 	if !node && (changed(previous.Shards, current.Shards) || changed(previous.Replicas, current.Replicas)) {
 		return 0, false, nil
 	}
@@ -113,75 +95,6 @@ func counterPoint(previous, current samples, width int64, metric Metric, node bo
 		return 0, false, nil
 	}
 	return (b - a) / (d - c), true, nil
-}
-
-const (
-	jvmTimestamp   = "payload.elasticsearch.node_stats.jvm.timestamp"
-	jvmUptime      = "payload.elasticsearch.node_stats.jvm.uptime_in_millis"
-	jvmSampleLimit = 64
-	jvmStart       = "payload.elasticsearch.node_stats.jvm.start_time_estimate_in_millis"
-)
-
-// The node's own timestamp and uptime share a clock. Reject a bucket if
-// its lifetime evidence is missing or truncated, even as a baseline.
-func (p samples) jvmLifetime() (int64, int64, bool) {
-	if p.Count <= 0 || p.JVMCount == nil {
-		return 0, 0, false
-	}
-	legacy := 0
-	if p.JVMLegacy != nil {
-		legacy = p.JVMLegacy.Count
-	}
-	if legacy < 0 || legacy > p.Count || p.JVMCount.Value == nil || *p.JVMCount.Value != float64(p.Count-legacy) {
-		return 0, 0, false
-	}
-	var lo, hi int64
-	if legacy > 0 {
-		var ok bool
-		lo, hi, ok = hitJVMLifetime(p.JVMLegacy.JVM, legacy)
-		if !ok {
-			return 0, 0, false
-		}
-	}
-	if legacy == p.Count {
-		return lo, hi, true
-	}
-	a, haveLo := number(p.JVMMin)
-	b, haveHi := number(p.JVMMax)
-	if !haveLo || !haveHi || !(a > 0 && b >= a && b < 1<<53) || a != float64(int64(a)) || b != float64(int64(b)) {
-		return 0, 0, false
-	}
-	if legacy == 0 {
-		return int64(a), int64(b), true
-	}
-	return min(lo, int64(a)), max(hi, int64(b)), true
-}
-
-func hitJVMLifetime(hits *jvmHits, count int) (int64, int64, bool) {
-	if hits == nil || len(hits.Hits.Rows) != count {
-		return 0, 0, false
-	}
-	var lo, hi int64
-	for i, row := range hits.Hits.Rows {
-		ts, uptime := row.Fields[jvmTimestamp], row.Fields[jvmUptime]
-		if len(ts) != 1 || len(uptime) != 1 || uptime[0] < 0 || ts[0] <= uptime[0] {
-			return 0, 0, false
-		}
-		start := ts[0] - uptime[0]
-		if i == 0 {
-			lo, hi = start, start
-		} else {
-			lo, hi = min(lo, start), max(hi, start)
-		}
-	}
-	return lo, hi, true
-}
-
-func sameJVMLifetime(previous, current samples) bool {
-	const toleranceMS = 1000
-	a, b, ok := previous.jvmLifetime()
-	c, d, otherOK := current.jvmLifetime()
-	return ok && otherOK && max(b, d)-min(a, c) <= toleranceMS
 }
 
 func changed(a, b *scalar) bool {
@@ -254,7 +167,7 @@ func metricAggs(q Query, metric Metric) dsl {
 	case peak:
 		return dsl{"value": maximum(metric.Field)}
 	}
-	buckets := counterEvidence(q, metric.jvmSummary)
+	buckets := counterEvidence(q)
 	if metric.mode == latency {
 		buckets["pair"] = latencyPair(metric)
 	} else {
@@ -263,7 +176,7 @@ func metricAggs(q Query, metric Metric) dsl {
 	return buckets
 }
 
-func counterEvidence(q Query, jvmSummary bool) dsl {
+func counterEvidence(q Query) dsl {
 	buckets := dsl{}
 	node := q.Source == "node_stats"
 	identity := "metadata.labels.index_uuid"
@@ -271,17 +184,7 @@ func counterEvidence(q Query, jvmSummary bool) dsl {
 		identity = "metadata.labels.node_id"
 	}
 	buckets["identity"] = dsl{"terms": terms(identity, 2)}
-	if node {
-		buckets["jvm_start_min"] = dsl{"min": dsl{"field": jvmStart}}
-		buckets["jvm_start_max"] = maximum(jvmStart)
-		buckets["jvm_start_count"] = dsl{"value_count": dsl{"field": jvmStart}}
-		if !jvmSummary {
-			buckets["jvm_legacy"] = dsl{"filter": withoutJVMStart(), "aggs": dsl{"jvm_lifetime": dsl{"top_hits": dsl{
-				"size": jvmSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
-				"docvalue_fields": []string{jvmTimestamp, jvmUptime},
-			}}}}
-		}
-	} else {
+	if !node {
 		buckets["shards"] = maximum("payload.elasticsearch.index_stats.index_info.shards")
 		buckets["replicas"] = maximum("payload.elasticsearch.index_stats.index_info.replicas")
 	}

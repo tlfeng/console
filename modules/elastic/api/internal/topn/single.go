@@ -9,9 +9,6 @@ import (
 
 func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
 	budget := searchBucketLimit - 2 // Reserve the scan and history filter buckets.
-	if metric.jvmSummary {
-		budget-- // The same-search JVM availability filter.
-	}
 	const maxCandidates = 192
 	capacity := budget / (metricBucketCost(q, metric) + 1)
 	selectedOnly := q.selected != nil
@@ -35,10 +32,6 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	aggs := dsl{"scan": dsl{"filter": metricScope(q, metric), "aggs": dsl{"entities": dsl{
 		"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))},
 	}}}}
-	if metric.jvmSummary {
-		// Check availability in the same read as the data, not in a separate live search.
-		aggs["missing_jvm_start"] = missingJVMStarts(q)
-	}
 	// The target is a concrete index or alias. ES 6.8 does not support hidden wildcard expansion.
 	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false"
 	request := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": aggs}
@@ -61,15 +54,6 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	}
 	if !response.complete() {
 		return errors.New("incomplete monitoring search")
-	}
-	if metric.jvmSummary {
-		missing, err := hasMissingJVMStarts(response.Aggs["missing_jvm_start"])
-		if err != nil {
-			return err
-		}
-		if missing {
-			return errLegacyJVM
-		}
 	}
 	var scan struct {
 		Entities struct {

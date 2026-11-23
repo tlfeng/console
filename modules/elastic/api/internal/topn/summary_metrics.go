@@ -72,7 +72,7 @@ type transitionBatch struct {
 // Rates need one maximum; latency needs two counters from one document.
 // Share the scan and its identity/topology evidence across all requested metrics.
 func transitionAggs(q Query, batches []transitionBatch) (dsl, []int, error) {
-	aggs := counterEvidence(q, false)
+	aggs := counterEvidence(q)
 	rateSlots := [...]string{"value", "other"}
 	pairSlots := [...]string{"pair", "second_pair"}
 	rates := make(map[string]int, len(rateSlots))

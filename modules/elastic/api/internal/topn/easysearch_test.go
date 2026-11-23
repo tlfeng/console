@@ -272,61 +272,58 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("restart inside bucket", func(t *testing.T) {
-		for _, history := range []string{"legacy", "mixed", "summary"} {
-			t.Run(history, func(t *testing.T) {
-				// One address and node ID, but two JVM lifetimes in the middle bucket.
-				for i, row := range []struct{ offset, uptime, count int }{
-					{1000, 1000, 10}, {20100, 20100, 50}, {24000, 100, 1}, {59000, 35100, 150}, {79000, 55100, 190},
-				} {
-					jvm := dsl{"timestamp": epoch + row.offset, "uptime_in_millis": row.uptime}
-					if history == "summary" || (history == "mixed" && i%2 == 0) {
-						jvm["start_time_estimate_in_millis"] = epoch + int64(row.offset-row.uptime)
-					}
-					doc := dsl{
-						"timestamp": epoch + row.offset, "metric": row.count, "ops": row.count, "elapsed": row.count * 3,
-						"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": history, "transport_address": "n1", "node_id": "same-node"}},
-						"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": jvm}}},
-					}
-					must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-%d?refresh=true", index, history, i), doc)
-					if row.offset == 79000 {
-						// Same identity and lifetime, but unusable operation counts must not hide the valid pair.
-						doc["ops"], doc["elapsed"] = []int{900, 999}, 9990
-						must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-decoy?refresh=true", index, history), doc)
-					}
+	t.Run("paired latency decoys do not hide the valid observation", func(t *testing.T) {
+		// One address and node ID across five buckets; a multivalued decoy lands in the last one.
+		for i, row := range []struct{ offset, count int }{
+			{1000, 10}, {20100, 50}, {24000, 55}, {59000, 150}, {79000, 190},
+		} {
+			doc := dsl{
+				"timestamp": epoch + row.offset, "metric": row.count, "ops": row.count, "elapsed": row.count * 3,
+				"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "decoy", "transport_address": "n1", "node_id": "same-node"}},
+				"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": dsl{"timestamp": epoch + row.offset, "uptime_in_millis": row.offset}}}},
+			}
+			must("PUT", fmt.Sprintf("/%s/_doc/decoy-%d?refresh=true", index, i), doc)
+			if row.offset == 79000 {
+				// Same identity, but unusable operation counts must not hide the valid pair.
+				doc["ops"], doc["elapsed"] = []int{900, 999}, 9990
+				must("PUT", fmt.Sprintf("/%s/_doc/decoy-broken?refresh=true", index), doc)
+			}
+		}
+		decoy := Query{Cluster: "decoy", Source: "node_stats", Min: epoch, Max: epoch + 79999, Width: 20, N: 1}
+		// Every transition is valid now, so each chart shows all three: rates
+		// 2.25, 4.75, 2 and a constant 3 ms per operation.
+		for _, tc := range []struct {
+			key, field, second string
+			mode               metricMode
+			want               [][]interface{}
+		}{
+			{"query_rate", "metric", "", rate, [][]interface{}{{int64(epoch + 20000), 2.25}, {int64(epoch + 40000), 4.75}, {int64(epoch + 60000), 2.0}}},
+			{"query_latency", "elapsed", "ops", latency, [][]interface{}{{int64(epoch + 20000), 3.0}, {int64(epoch + 40000), 3.0}, {int64(epoch + 60000), 3.0}}},
+		} {
+			selected := decoy
+			selected.selected = selectEntities(selected, "n1")
+			metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
+			pred, _ := selected.filter()
+			if err := runSelected(ctx, call, alias, pred, selected, metric); err != nil {
+				t.Fatal(err)
+			}
+			if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, tc.want) {
+				t.Fatalf("%s selected: got %+v want %v", tc.key, metric.Item.Lines[0].Data, tc.want)
+			}
+			for _, usePIT := range []bool{false, true} {
+				pred, _ := decoy.filter()
+				metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
+				var api pitAPI
+				if usePIT {
+					api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
 				}
-				restart := Query{Cluster: history, Source: "node_stats", Min: epoch, Max: epoch + 79999, Width: 20, N: 1}
-				for _, tc := range []struct {
-					key, field, second string
-					mode               metricMode
-					want               float64
-				}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "ops", latency, 3}} {
-					selected := restart
-					selected.selected = selectEntities(selected, "n1")
-					metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
-					pred, _ := selected.filter()
-					if err := runSelected(ctx, call, alias, pred, selected, metric); err != nil {
-						t.Fatal(err)
-					}
-					if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
-						t.Fatalf("%s selected: wrong recovery point", tc.key)
-					}
-					for _, usePIT := range []bool{false, true} {
-						pred, _ := restart.filter()
-						metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
-						var api pitAPI
-						if usePIT {
-							api = pitFor(elastic.Version{Distribution: elastic.Easysearch})
-						}
-						if err := runQuery(ctx, call, api, alias, pred, restart, metric); err != nil {
-							t.Fatal(err)
-						}
-						if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, [][]interface{}{{int64(epoch + 60000), tc.want}}) {
-							t.Fatalf("%s PIT=%v: expected only the recovery point at %v, got %+v", tc.key, usePIT, tc.want, metric.Item.Lines)
-						}
-					}
+				if err := runQuery(ctx, call, api, alias, pred, decoy, metric); err != nil {
+					t.Fatal(err)
 				}
-			})
+				if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, tc.want) {
+					t.Fatalf("%s PIT=%v: got %+v want %v", tc.key, usePIT, metric.Item.Lines[0].Data, tc.want)
+				}
+			}
 		}
 	})
 

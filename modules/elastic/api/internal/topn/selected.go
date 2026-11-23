@@ -2,7 +2,6 @@ package topn
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 )
@@ -35,13 +34,5 @@ func selectEntities(q Query, names string) []string {
 }
 
 func runSelected(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
-	if q.Source == "node_stats" && metric.mode.difference() {
-		summary := metric
-		summary.jvmSummary = true
-		err := singleSearch(ctx, call, index, pred, q, summary)
-		if !errors.Is(err, errLegacyJVM) || ctx.Err() != nil {
-			return err
-		}
-	}
 	return singleSearch(ctx, call, index, pred, q, metric)
 }
