@@ -185,7 +185,7 @@ func main() {
 				}
 			}
 
-			elasticAPI.StartTopNMaterialization()
+			elasticAPI.StartTopNSummary()
 
 			task1.RunWithinGroup("initialize_alerting", func(ctx context.Context) error {
 				err := alerting2.InitTasks()

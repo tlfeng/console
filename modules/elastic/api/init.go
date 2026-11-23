@@ -31,8 +31,8 @@ import (
 
 var clusterAPI APIHandler
 
-func StartTopNMaterialization() {
-	topn.StartMaterialized()
+func StartTopNSummary() {
+	topn.StartSummary()
 }
 
 func init() {

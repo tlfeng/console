@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +194,14 @@ func TestEasysearchSnapshot(t *testing.T) {
 			"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "biz", "transport_address": row.name}},
 		})
 	}
+	// Keep this in one bucket: older code rejected even the manual curve at 101 samples.
+	for i := 0; i < 101; i++ {
+		must("PUT", "/"+index+fmt.Sprintf("/_doc/dense-disk-%d", i), dsl{
+			"timestamp": epoch + 2001, "total": 100, "available": 20,
+			"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "biz", "transport_address": "small"}},
+		})
+	}
+	must("POST", "/"+index+"/_refresh", nil)
 	q.Source, q.N = "node_stats", 4
 	for _, usePIT := range []bool{false, true} {
 		pred, _ := q.filter()
@@ -274,18 +283,24 @@ func TestEasysearchSnapshot(t *testing.T) {
 					if history == "summary" || (history == "mixed" && i%2 == 0) {
 						jvm["start_time_estimate_in_millis"] = epoch + int64(row.offset-row.uptime)
 					}
-					must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-%d?refresh=true", index, history, i), dsl{
-						"timestamp": epoch + row.offset, "metric": row.count, "elapsed": row.count * 3,
+					doc := dsl{
+						"timestamp": epoch + row.offset, "metric": row.count, "ops": row.count, "elapsed": row.count * 3,
 						"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": history, "transport_address": "n1", "node_id": "same-node"}},
 						"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": jvm}}},
-					})
+					}
+					must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-%d?refresh=true", index, history, i), doc)
+					if row.offset == 79000 {
+						// Same identity and lifetime, but unusable operation counts must not hide the valid pair.
+						doc["ops"], doc["elapsed"] = []int{900, 999}, 9990
+						must("PUT", fmt.Sprintf("/%s/_doc/restart-%s-decoy?refresh=true", index, history), doc)
+					}
 				}
 				restart := Query{Cluster: history, Source: "node_stats", Min: epoch, Max: epoch + 79999, Width: 20, N: 1}
 				for _, tc := range []struct {
 					key, field, second string
 					mode               metricMode
 					want               float64
-				}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "metric", latency, 3}} {
+				}{{"query_rate", "metric", "", rate, 2}, {"query_latency", "elapsed", "ops", latency, 3}} {
 					selected := restart
 					selected.selected = selectEntities(selected, "n1")
 					metric := Metric{Item: &common.MetricItem{Key: tc.key}, Field: tc.field, Field2: tc.second, mode: tc.mode}
@@ -338,7 +353,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 	t.Run("reads and deduplicates summary rollover generations", func(t *testing.T) {
 		alias := ".console-topn-" + index + "-rollover"
 		raw := index
-		m := materializedStore{raw: raw, index: alias}
+		m := summaryStore{raw: raw, index: alias}
 		t.Cleanup(func() {
 			for _, name := range []string{alias + "-000001", alias + "-000002"} {
 				_, _ = call(context.Background(), "DELETE", "/"+name, nil)
@@ -346,18 +361,18 @@ func TestEasysearchSnapshot(t *testing.T) {
 			_, _ = call(context.Background(), "DELETE", "/_index_template/"+alias+"-rollover", nil)
 		})
 		api := pitFor(elastic.Version{Distribution: elastic.Easysearch})
-		mapping := dsl{"dynamic": false, "_meta": dsl{"console_topn": materializedVersion}}
+		mapping := dsl{"dynamic": false, "_meta": dsl{"console_topn": summaryVersion}}
 		must("PUT", "/_index_template/"+alias+"-rollover", dsl{"index_patterns": []string{alias + "-*"}, "priority": 1000, "template": dsl{"mappings": mapping}})
 		must("PUT", "/"+alias+"-000001", dsl{"mappings": mapping, "aliases": dsl{alias: dsl{"is_write_index": true}}})
 		q := Query{Cluster: "biz", Width: 1}
 		proof := rawBucketProof{1000: {"one": 1}, 2000: {"one": 1}}
 		digest := proof.transition(2000, 1000)
 		id := m.provenID(q, writeRateKey, 2000, digest)
-		score := dsl{"v": materializedVersion, "t": 2000, "n": []string{"a"}, "s": []float64{3}, "p": digest}
+		score := dsl{"v": summaryVersion, "t": 2000, "n": []string{"a"}, "s": []float64{3}, "p": digest}
 		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
 		must("POST", "/"+alias+"/_rollover", dsl{})
 		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
-		if err := checkMaterializedIndex(ctx, call, m); err != nil {
+		if err := checkSummaryIndex(ctx, call, m); err != nil {
 			t.Fatal(err)
 		}
 		snap, err := open(ctx, call, alias, api)
@@ -371,7 +386,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("materialized scores follow raw backing expiry", func(t *testing.T) {
+	t.Run("summary scores follow raw backing expiry", func(t *testing.T) {
 		old, recent, tail := index+"-expiry-old", index+"-expiry-recent", index+"-expiry-tail"
 		alias, summary := index+"-expiry-raw", ".console-topn-"+index+"-expiry-summary"
 		for _, name := range []string{old, recent, tail} {
@@ -382,30 +397,43 @@ func TestEasysearchSnapshot(t *testing.T) {
 			_, _ = call(context.Background(), "DELETE", "/"+recent, nil)
 			_, _ = call(context.Background(), "DELETE", "/"+old, nil)
 		})
-		must("PUT", "/"+summary, dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "mappings": dsl{"dynamic": false, "_meta": dsl{"console_topn": materializedVersion}}})
+		must("PUT", "/"+summary, dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "mappings": dsl{"dynamic": false, "_meta": dsl{"console_topn": summaryVersion}}})
 		t.Cleanup(func() { _, _ = call(context.Background(), "DELETE", "/"+summary, nil) })
 		for i, r := range []struct {
 			target          string
 			offset, counter int
 		}{{old, 1, 10}, {recent, 2, 5}, {recent, 1001, 20}, {recent, 2001, 25}, {tail, 3001, 27}} {
-			must("PUT", fmt.Sprintf("/%s/_doc/%d?refresh=true", r.target, i), dsl{"timestamp": epoch + r.offset, "metric": r.counter, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "expiry", "index_name": "a", "index_uuid": "a-uuid"}}})
+			must("PUT", fmt.Sprintf("/%s/_doc/%d?refresh=true", r.target, i), dsl{"timestamp": epoch + r.offset, "metric": r.counter, "elapsed": r.counter * 3, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "expiry", "index_name": "a", "index_uuid": "a-uuid"}}})
 		}
-		m := materializedStore{index: summary, raw: alias}
+		m := summaryStore{index: summary, raw: alias}
 		q := Query{Cluster: "expiry", Source: "index_stats", Min: epoch + 1000, Max: epoch + 3999, Width: 1, N: 1, AllIndices: true}
 		starts := []int64{epoch + 1000, epoch + 2000, epoch + 3000}
 		api := pitFor(elastic.Version{Distribution: elastic.Easysearch})
-		makeMetric := func() Metric { metric := materializedMetric(writeRateKey); metric.Field = "metric"; return metric }
+		makeMetric := func() Metric { metric := summaryMetric(writeRateKey); metric.Field = "metric"; return metric }
 		now := time.UnixMilli(epoch + 86400000)
-		if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeMetric(), starts}}); err != nil {
+		makeLatency := func() Metric {
+			metric := summaryMetric(writeLatencyKey)
+			metric.Field, metric.Field2 = "elapsed", "metric"
+			return metric
+		}
+		if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeMetric(), starts}, {makeLatency(), starts}}); err != nil {
 			t.Fatal(err)
 		}
 		must("POST", "/"+summary+"/_refresh", nil)
 		before := makeMetric()
-		if err := readMaterialized(ctx, call, api, m, q, before, now); err != nil {
+		if err := readSummary(ctx, call, api, m, q, before, now); err != nil {
 			t.Fatal(err)
 		}
 		if got := before.Item.Lines[0].Data; !reflect.DeepEqual(got, [][]interface{}{{int64(epoch + 1000), 10.0}, {int64(epoch + 2000), 5.0}, {int64(epoch + 3000), 2.0}}) {
 			t.Fatal(got)
+		}
+		paired := makeLatency()
+		if err := readSummary(ctx, call, api, m, q, paired, now); err != nil {
+			t.Fatal(err)
+		}
+		wantLatency := [][]interface{}{{int64(epoch + 1000), 3.0}, {int64(epoch + 2000), 3.0}, {int64(epoch + 3000), 3.0}}
+		if len(paired.Item.Lines) != 1 || !reflect.DeepEqual(paired.Item.Lines[0].Data, wantLatency) {
+			t.Fatalf("incorrect latency summary: %+v", paired.Item.Lines)
 		}
 		original, err := openRawSummary(ctx, call, alias, api)
 		if err != nil {
@@ -468,7 +496,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		})
 		t.Run("verified empty transition is readable", func(t *testing.T) {
 			makeEmpty := func() Metric {
-				metric := materializedMetric(queryLatencyKey)
+				metric := summaryMetric(queryLatencyKey)
 				metric.Field = "metric"
 				metric.Field2 = "absent_counter"
 				return metric
@@ -478,7 +506,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			}
 			must("POST", "/"+summary+"/_refresh", nil)
 			metric := makeEmpty()
-			if err := readMaterialized(ctx, call, api, m, q, metric, now); err != nil || len(metric.Item.Lines) != 0 {
+			if err := readSummary(ctx, call, api, m, q, metric, now); err != nil || len(metric.Item.Lines) != 0 {
 				t.Fatalf("proved empty result: %v %v", err, metric.Item.Lines)
 			}
 		})
@@ -487,7 +515,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		if found, err := lookupRetainedJob(ctx, call, api, m, q, cached, now, key); found || err != nil || len(cached.Item.Lines) != 0 {
 			t.Fatalf("expired cached result: %v %v %v", found, err, cached.Item.Lines)
 		}
-		if err := readMaterialized(ctx, call, api, m, q, makeMetric(), now); !errors.Is(err, errSummaryMissing) {
+		if err := readSummary(ctx, call, api, m, q, makeMetric(), now); !errors.Is(err, errSummaryMissing) {
 			t.Fatalf("partly expired predecessor reused: %v", err)
 		}
 		stale := newScoreBucket(starts[0])
@@ -511,7 +539,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 		must("DELETE", "/"+recent, nil)
 		expired := makeMetric()
-		if err := readMaterialized(ctx, call, api, m, q, expired, now); err != nil || len(expired.Item.Lines) != 0 {
+		if err := readSummary(ctx, call, api, m, q, expired, now); err != nil || len(expired.Item.Lines) != 0 {
 			t.Fatalf("expired points must not rank: %v %v", err, expired.Item.Lines)
 		}
 		writes := 0
@@ -656,15 +684,20 @@ func TestElasticsearch68SingleSearch(t *testing.T) {
 	}
 	version := elastic.Version{Distribution: elastic.Elasticsearch, Number: info.Version.Number}
 	for _, tc := range []struct {
-		key, field, name string
-		derived          bool
-		value            float64
-		at               int64
-	}{{"index_storage", "store", "a", false, 50, epoch}, {"indexing_rate", "counter", "b", true, 8, epoch + 1000}} {
+		key, field, second, name string
+		derived                  bool
+		value                    float64
+		at                       int64
+	}{
+		{"index_storage", "store", "", "a", false, 50, epoch},
+		{"indexing_rate", "counter", "", "b", true, 8, epoch + 1000},
+		{"os_used_swap", "counter", "store", "b", false, 40, epoch + 1000},
+		{"query_latency", "store", "counter", "a", true, 0, epoch + 1000},
+	} {
 		q := Query{Cluster: "es68", Source: "index_stats", Min: epoch, Max: epoch + 1999, Width: 1, N: 1, AllIndices: true}
 		q.setSearchVersion(version)
 		pred, _ := q.filter()
-		metric, ok := NewMetric(&common.MetricItem{Key: tc.key}, tc.field, "", "", "", tc.derived)
+		metric, ok := NewMetric(&common.MetricItem{Key: tc.key}, tc.field, tc.second, "", "", tc.derived)
 		if !ok {
 			t.Fatal(tc.key)
 		}
@@ -676,7 +709,9 @@ func TestElasticsearch68SingleSearch(t *testing.T) {
 			t.Fatalf("%s: unexpected winner: %+v", tc.key, lines)
 		}
 		points := lines[0].Data.([][]interface{})
-		if len(points) == 0 || !reflect.DeepEqual(points[0], []interface{}{tc.at, tc.value}) {
+		if !slices.ContainsFunc(points, func(point []interface{}) bool {
+			return reflect.DeepEqual(point, []interface{}{tc.at, tc.value})
+		}) {
 			t.Fatalf("%s: unexpected points: %v", tc.key, points)
 		}
 	}

@@ -8,24 +8,30 @@ import (
 )
 
 func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
-	budget := 5998 // Reserve the scan and history filter buckets.
+	budget := searchBucketLimit - 2 // Reserve the scan and history filter buckets.
 	if metric.jvmSummary {
 		budget-- // The same-search JVM availability filter.
 	}
-	limit := min(192, budget/(metricBucketCost(q, metric)+1)-1)
-	if limit < 1 {
-		return errBudget
-	}
-	entityTerms := terms(q.entity(), limit+1)
-	if q.selected != nil {
-		if len(q.selected) > limit {
+	const maxCandidates = 192
+	capacity := budget / (metricBucketCost(q, metric) + 1)
+	selectedOnly := q.selected != nil
+	// Automatic ranking needs one extra candidate to detect truncation.
+	maxEntities := min(maxCandidates+1, capacity)
+	if selectedOnly {
+		maxEntities = len(q.selected)
+		if maxEntities == 0 {
+			return nil
+		}
+		if maxEntities > min(maxCandidates, capacity) {
 			return errBudget
 		}
-		entityTerms = terms(q.entity(), len(q.selected))
+	} else if maxEntities < 2 {
+		return errBudget
 	}
+	entityTerms := terms(q.entity(), maxEntities)
 	entityTerms["order"] = dsl{"_key": "asc"}
-	// Every shard containing a globally first L+1 key also has it in its
-	// local first L+1. Fewer than L+1 results therefore prove completeness.
+	// The first maxEntities keys are visible across shards, so a full automatic
+	// response cannot prove that every candidate was ranked.
 	aggs := dsl{"scan": dsl{"filter": metricScope(q, metric), "aggs": dsl{"entities": dsl{
 		"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))},
 	}}}}
@@ -42,9 +48,6 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	raw, err := call(ctx, http.MethodPost, path, request)
 	if err != nil {
 		return err
-	}
-	if len(raw) > responseLimit {
-		return errBudget
 	}
 	var response searchResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
@@ -85,16 +88,14 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if entities == nil {
 		return errors.New("missing TopN entities")
 	}
-	maxEntities := limit + 1
 	var selected map[string]winner
-	if q.selected != nil {
-		maxEntities = len(q.selected)
+	if selectedOnly {
 		selected = make(map[string]winner, maxEntities)
 	}
 	if len(entities) > maxEntities {
 		return errors.New("oversized TopN entity response")
 	}
-	truncated := q.selected == nil && len(entities) == limit+1
+	truncated := !selectedOnly && len(entities) == maxEntities
 	best := make([]winner, 0, q.N)
 	allowed := q.authorizer()
 	last := ""

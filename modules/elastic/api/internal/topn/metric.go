@@ -15,11 +15,10 @@ const (
 	rate
 	latency
 	ratio
-	storageGrowth
 )
 
 func (m metricMode) difference() bool {
-	return m == rate || m == latency || m == storageGrowth
+	return m == rate || m == latency
 }
 
 type Metric struct {
@@ -52,10 +51,8 @@ func NewMetric(item *common.MetricItem, field, field2, units, format string, der
 		}
 	case field2 != "":
 		m.mode = latency
-	case item.Key == "indexing_bytes":
-		// The legacy chart shows positive store-size change, not bytes written.
-		m.mode = storageGrowth
 	default:
+		// Store-size growth also uses the positive per-second difference.
 		m.mode = rate
 	}
 	return m, true
@@ -115,17 +112,19 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 		v, valid := number(p.Value)
 		switch metric.mode {
 		case ratio:
-			var err error
-			v, valid, err = observedRatio(p, metric)
-			if err != nil {
-				return winner{}, err
+			if p.Value == nil || p.Value.Value == nil {
+				return winner{}, fmt.Errorf("missing ratio aggregation for %q", name)
 			}
 		case peak:
 			if !valid {
 				return winner{}, fmt.Errorf("missing peak sample for %q", name)
 			}
 		default:
-			v, valid = counterPoint(previous, p, width, metric.mode, q.Source == "node_stats")
+			var err error
+			v, valid, err = counterPoint(previous, p, width, metric, q.Source == "node_stats")
+			if err != nil {
+				return winner{}, err
+			}
 		}
 		previous = p
 		if ts < first || !valid || math.IsInf(v, 0) || math.IsNaN(v) {
@@ -141,28 +140,4 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 		row.score = max(row.score, v)
 	}
 	return row, nil
-}
-
-func observedRatio(p samples, metric Metric) (float64, bool, error) {
-	if p.Count > ratioSampleLimit {
-		return 0, false, errBudget
-	}
-	if p.Ratio == nil || p.Count <= 0 || len(p.Ratio.Hits.Rows) != p.Count {
-		return 0, false, fmt.Errorf("incomplete ratio observations")
-	}
-	best := -1.0
-	for _, row := range p.Ratio.Hits.Rows {
-		a, b := row.Fields[metric.Field], row.Fields[metric.Field2]
-		if metric.reverseRatio {
-			a, b = b, a
-		}
-		if len(a) != 1 || len(b) != 1 || a[0] < 0 || b[0] <= 0 {
-			continue
-		}
-		v := a[0] / b[0] * 100
-		if !math.IsNaN(v) && !math.IsInf(v, 0) {
-			best = max(best, v)
-		}
-	}
-	return best, best >= 0, nil
 }

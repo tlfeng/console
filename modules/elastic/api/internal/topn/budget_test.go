@@ -2,47 +2,10 @@ package topn
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
-
-	"infini.sh/framework/core/util"
 )
-
-func TestQueryBudgetAcrossAttempts(t *testing.T) {
-	var calls int
-	call := budgetedCaller(func(_ context.Context, method, _ string, _ dsl) ([]byte, error) {
-		calls++
-		if method == "DELETE" {
-			return []byte("cleanup"), nil
-		}
-		if calls == 1 {
-			return []byte("single"), nil
-		}
-		return []byte("PIT"), nil
-	}, 8)
-	ctx := context.Background()
-	if _, err := call(ctx, "POST", "/single", nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := call(ctx, "POST", "/_pit", nil); !errors.Is(err, errBudget) {
-		t.Fatalf("combined overflow: %v", err)
-	}
-	if _, err := call(ctx, "POST", "/_search", nil); !errors.Is(err, errBudget) || calls != 2 {
-		t.Fatalf("extra search after exhaustion: %d %v", calls, err)
-	}
-	if _, err := call(ctx, "DELETE", "/_pit", nil); err != nil || calls != 3 {
-		t.Fatalf("cleanup blocked: %d %v", calls, err)
-	}
-}
-
-func TestTransportBudgetFailure(t *testing.T) {
-	call := budgetedCaller(func(context.Context, string, string, dsl) ([]byte, error) { return nil, util.ErrResponseBodyTooLarge }, 16)
-	if _, err := call(context.Background(), "POST", "/_search", nil); !errors.Is(err, errBudget) {
-		t.Fatalf("got %v", err)
-	}
-}
 
 func TestBackendTimeoutKeepsRotatedPIT(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

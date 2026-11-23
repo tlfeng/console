@@ -16,7 +16,7 @@ func TestSummaryReusesRawPolicy(t *testing.T) {
 	for _, distribution := range []string{elastic.Easysearch, elastic.Elasticsearch, elastic.Opensearch} {
 		t.Run(distribution, func(t *testing.T) {
 			ctx := context.Background()
-			m := materializedStore{raw: "raw", index: ".console-topn-test"}
+			m := summaryStore{raw: "raw", index: ".console-topn-test"}
 			generation := m.index + "-000001"
 			created, attached := false, false
 			var template dsl

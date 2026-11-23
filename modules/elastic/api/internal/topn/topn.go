@@ -32,8 +32,8 @@ var (
 
 type config struct {
 	TopN struct {
-		RawIndex     string             `config:"raw_index"`
-		Materialized materializedConfig `config:"materialized"`
+		RawIndex string        `config:"raw_index"`
+		Summary  summaryConfig `config:"summary"`
 	} `config:"topn"`
 }
 
@@ -202,6 +202,9 @@ func monitoredStore() (caller, elastic.Version, string) {
 		return nil, elastic.Version{}, ""
 	}
 	return func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var wire []byte
 		if body != nil {
 			var err error
@@ -211,6 +214,13 @@ func monitoredStore() (caller, elastic.Version, string) {
 			}
 		}
 		res, err := transport.Request(ctx, method, base+path, wire)
+		// Keep any returned PIT ID available for cleanup even on cancellation.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if err == nil && res != nil {
+				return res.Body, ctxErr
+			}
+			return nil, ctxErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -264,8 +274,6 @@ type snapshot struct {
 	api           pitAPI
 	id            string
 	shards        int
-	bytes         int
-	responseLimit int
 }
 
 func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot, error) {
@@ -373,13 +381,6 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if err != nil && len(raw) == 0 {
 		return err
 	}
-	limit := s.responseLimit
-	if limit == 0 {
-		limit = responseLimit
-	}
-	if len(raw) > limit-s.bytes {
-		return errBudget
-	}
 	var response searchResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return err
@@ -390,7 +391,6 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 	if err != nil {
 		return err
 	}
-	s.bytes += len(raw)
 	if response.TimedOut != nil && *response.TimedOut {
 		return context.DeadlineExceeded
 	}
@@ -554,8 +554,13 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return errUnavailable
 	}
-	materialized := q.selected == nil && useMaterialized(q, metric) && cfg.TopN.Materialized.enabled(q.Cluster, metric.Item.Key)
-	if materialized && !q.AllIndices && len(q.Indices) == 0 {
+	return calculateWithConfig(ctx, q, metric, poll, cfg, monitoredStore)
+}
+
+func calculateWithConfig(ctx context.Context, q Query, metric Metric, poll bool, cfg config, store func() (caller, elastic.Version, string)) error {
+	sc := cfg.TopN.Summary
+	summaryEligible := q.selected == nil && useSummary(q, metric) && sc.enabled(q.Cluster, metric.Item.Key)
+	if summaryEligible && !q.AllIndices && len(q.Indices) == 0 {
 		return nil
 	}
 	pred, ok := q.filter()
@@ -569,21 +574,32 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	if q.Max/(int64(q.Width)*1000)-q.Min/(int64(q.Width)*1000)+1 > 512 {
 		return errBudget
 	}
-	call, version, scope := monitoredStore()
+	call, version, scope := store()
 	if call == nil {
 		return errUnavailable
 	}
 	q.setSearchVersion(version)
 	q.storeScope = scope
 	api := pitFor(version)
-	var m materializedStore
-	if materialized {
-		m, err = cfg.TopN.Materialized.store(index)
+	// Unsupported stores use the existing bounded raw route. Once selected,
+	// summary errors must not fall back to raw or bypass the configured gaps.
+	useSummaryStore := summaryEligible && api.path != ""
+	var m summaryStore
+	if summaryEligible && (useSummaryStore || len(sc.Gaps) != 0) {
+		m, err = sc.store(index)
 		if err != nil {
 			return err
 		}
+		if !useSummaryStore {
+			width := int64(q.Width) * 1000
+			if !m.covered(max(0, q.Min/width*width-width), q.Max) {
+				return errSummaryHistory
+			}
+		}
+	}
+	if useSummaryStore {
 		// Pending jobs need no search slot; completed jobs acquire one for validation.
-		if cfg.TopN.Materialized.Enabled && poll && api.path != "" {
+		if sc.Enabled && poll {
 			if found, err := lookupRetainedJob(ctx, call, api, m, q, metric, time.Now(), summaryJobKey(m, q, metric)); found {
 				return err
 			}
@@ -593,19 +609,16 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
-		if materialized && cfg.TopN.Materialized.Enabled && poll {
-			return errSummaryBusy
-		}
-		return errBudget
+		return errSummaryBusy
 	}
 	if q.selected != nil {
 		return runSelected(ctx, call, index, pred, q, metric)
 	}
-	if materialized {
-		if cfg.TopN.Materialized.Enabled {
-			return readOnDemand(ctx, call, api, m, q, metric, time.Now(), cfg.TopN.Materialized.writes(), poll)
+	if useSummaryStore {
+		if sc.Enabled {
+			return readOnDemand(ctx, call, api, m, q, metric, time.Now(), sc, poll)
 		}
-		return readMaterialized(ctx, call, api, m, q, metric, time.Now())
+		return readSummary(ctx, call, api, m, q, metric, time.Now())
 	}
 	return runQuery(ctx, call, api, index, pred, q, metric)
 }
@@ -632,7 +645,6 @@ func hasMissingJVMStarts(raw json.RawMessage) (bool, error) {
 }
 
 func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric) error {
-	call = budgetedCaller(call, responseLimit)
 	nodeDifference := q.Source == "node_stats" && metric.mode.difference()
 	single := func() error {
 		m := metric
@@ -651,7 +663,7 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
 	if singleFirst {
 		singleErr = single()
-		if singleErr == nil || errors.Is(singleErr, errRawHistory) || errors.Is(singleErr, errResponseBudget) || api.path == "" || ctx.Err() != nil {
+		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
 			return singleErr
 		}
 	}

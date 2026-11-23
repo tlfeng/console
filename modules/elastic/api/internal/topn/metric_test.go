@@ -1,7 +1,6 @@
 package topn
 
 import (
-	"errors"
 	"reflect"
 	"testing"
 
@@ -16,7 +15,7 @@ func TestMetricModes(t *testing.T) {
 		reverse     bool
 	}{
 		{key: "cpu", mode: peak},
-		{key: "indexing_bytes", derivative: true, mode: storageGrowth},
+		{key: "indexing_bytes", derivative: true, mode: rate},
 		{key: "jvm_young_gc_latency", derivative: true, mode: rate},
 		{key: "query_latency", second: "count", derivative: true, mode: latency},
 		{key: "os_used_swap", second: "total", mode: ratio},
@@ -31,25 +30,13 @@ func TestMetricModes(t *testing.T) {
 
 func TestScoreSeries(t *testing.T) {
 	q := Query{Source: "index_stats", Min: 1001, Max: 4999, Width: 1, N: 1}
-	mk := func(ts int64, value, other *float64) samples {
-		return samples{Time: &ts, Value: &scalar{Value: value}, Other: &scalar{Value: other}}
+	mk := func(ts int64, value float64) samples {
+		return samples{Time: &ts, Value: &scalar{Value: &value}}
 	}
-	val := func(v float64) *float64 { return &v }
-	for _, tc := range []struct {
-		name    string
-		metric  Metric
-		samples []samples
-		want    [][]interface{}
-		score   float64
-	}{
-		{"peak gap", Metric{}, []samples{mk(1000, val(0), nil), mk(3000, val(4), nil)}, [][]interface{}{{int64(1000), 0.0}, {int64(2000), nil}, {int64(3000), 4.0}}, 4},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			row, err := scoreSeries(q, tc.metric, "entity", tc.samples)
-			if err != nil || row.score != tc.score || !reflect.DeepEqual(row.points, tc.want) {
-				t.Fatalf("row=%+v err=%v", row, err)
-			}
-		})
+	row, err := scoreSeries(q, Metric{}, "entity", []samples{mk(1000, 0), mk(3000, 4)})
+	want := [][]interface{}{{int64(1000), 0.0}, {int64(2000), nil}, {int64(3000), 4.0}}
+	if err != nil || row.score != 4 || !reflect.DeepEqual(row.points, want) {
+		t.Fatalf("row=%+v err=%v", row, err)
 	}
 	const identity = `,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]}}`
 	points := []samples{
@@ -57,33 +44,36 @@ func TestScoreSeries(t *testing.T) {
 		parseSample(t, `{"key":1000,"value":{"value":30}`+identity),
 		parseSample(t, `{"key":2000,"value":{"value":40}`+identity),
 	}
-	row, err := scoreSeries(q, Metric{mode: storageGrowth}, "index", points)
+	row, err = scoreSeries(q, Metric{mode: rate}, "index", points)
 	if err != nil || row.score != 10 || !reflect.DeepEqual(row.points, [][]interface{}{{int64(2000), 10.0}}) {
 		t.Fatalf("row=%+v err=%v", row, err)
 	}
 }
 
-func TestObservedRatio(t *testing.T) {
+func TestRatioAggregation(t *testing.T) {
+	q := Query{Min: 1000, Max: 1999, Width: 1}
 	metric := Metric{mode: ratio, Field: "total", Field2: "available", reverseRatio: true}
+	aggs := metricAggs(q, metric)
+	script := aggs["value"].(dsl)["max"].(dsl)["script"].(dsl)
+	if !reflect.DeepEqual(script["params"], dsl{"first": "available", "second": "total"}) {
+		t.Fatalf("disk must use available / total: %v", script)
+	}
 	for _, tc := range []struct {
 		name, raw string
-		want      float64
-		valid     bool
-		err       error
+		score     float64
 	}{
-		{"paired maxima", `{"doc_count":2,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100],"available":[90]}},{"fields":{"total":[200],"available":[100]}}]}}}`, 90, true, nil},
-		{"missing or zero divisor", `{"doc_count":3,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100]}},{"fields":{"available":[90]}},{"fields":{"total":[0],"available":[90]}}]}}}`, -1, false, nil},
-		{"zero available", `{"doc_count":1,"ratio_samples":{"hits":{"hits":[{"fields":{"total":[100],"available":[0]}}]}}}`, 0, true, nil},
-		{"over capacity", `{"doc_count":101}`, 0, false, errBudget},
+		{"dense bucket", `{"key":1000,"doc_count":360,"value":{"value":90}}`, 90},
+		{"invalid observations", `{"key":1000,"doc_count":360,"value":{"value":-1}}`, -1},
+		{"measured zero", `{"key":1000,"doc_count":360,"value":{"value":0}}`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, valid, err := observedRatio(parseSample(t, tc.raw), metric)
-			if !errors.Is(err, tc.err) || valid != tc.valid || got != tc.want {
-				t.Fatalf("got %v %v %v", got, valid, err)
+			row, err := scoreSeries(q, metric, "node", []samples{parseSample(t, tc.raw)})
+			if err != nil || row.score != tc.score || (len(row.points) != 0) != (tc.score >= 0) {
+				t.Fatalf("row=%+v err=%v", row, err)
 			}
 		})
 	}
-	if _, _, err := observedRatio(parseSample(t, `{"doc_count":2,"ratio_samples":{"hits":{"hits":[]}}}`), metric); err == nil {
-		t.Fatal("truncated observations accepted")
+	if _, err := scoreSeries(q, metric, "node", []samples{parseSample(t, `{"key":1000,"doc_count":360}`)}); err == nil {
+		t.Fatal("missing ratio result accepted")
 	}
 }

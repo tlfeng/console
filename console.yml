@@ -78,7 +78,7 @@ metrics:
 # Optional 15/30-day index TopN. Missing summaries are calculated on demand.
 # insight:
 #   topn:
-#     materialized:
+#     summary:
 #       enabled: true
 
 ## badger kv storage configuration

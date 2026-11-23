@@ -10,27 +10,27 @@ import (
 	"time"
 )
 
-func TestMaterializedScopes(t *testing.T) {
+func TestSummaryScopes(t *testing.T) {
 	q := Query{Min: 1500, Max: 5000, Width: 1}
-	sealed, edges := materializedScopes(q, 6000)
+	sealed, edges := summaryScopes(q, 6000)
 	if !reflect.DeepEqual(sealed, []int64{3000, 4000}) || !reflect.DeepEqual(edges, map[int64]bool{1000: true, 2000: true, 5000: true}) {
 		t.Fatalf("%v %v", sealed, edges)
 	}
 	q.Min, q.Max = 2000, 4999
-	sealed, edges = materializedScopes(q, 4000)
+	sealed, edges = summaryScopes(q, 4000)
 	if !reflect.DeepEqual(sealed, []int64{2000, 3000}) || !reflect.DeepEqual(edges, map[int64]bool{4000: true}) {
 		t.Fatalf("%v %v", sealed, edges)
 	}
 }
 
-func TestMaterializedRank(t *testing.T) {
+func TestSummaryRank(t *testing.T) {
 	q := Query{Cluster: "biz", Source: "index_stats", Min: 1000, Max: 5000, Width: 1, N: 2, Indices: []string{"a*", "b*"}}
-	m := materializedMetric(writeRateKey)
+	m := summaryMetric(writeRateKey)
 	buckets := []scoreBucket{
-		{materializedVersion, 5000, []string{"alpha", "beta"}, []float64{2, 0}, ""},
-		{materializedVersion, 1000, []string{"alpha", "beta", "restricted"}, []float64{5, 5, 99}, ""},
+		{summaryVersion, 5000, []string{"alpha", "beta"}, []float64{2, 0}, ""},
+		{summaryVersion, 1000, []string{"alpha", "beta", "restricted"}, []float64{5, 5, 99}, ""},
 	}
-	if err := materializedRank(q, m, buckets); err != nil {
+	if err := summaryRank(q, m, buckets); err != nil {
 		t.Fatal(err)
 	}
 	if len(m.Item.Lines) != 2 || m.Item.Lines[0].Metric.Label != "alpha" || m.Item.Lines[1].Metric.Label != "beta" {
@@ -42,9 +42,9 @@ func TestMaterializedRank(t *testing.T) {
 	}
 }
 
-func TestMaterializedRequiresEveryBucket(t *testing.T) {
+func TestSummaryRequiresEveryBucket(t *testing.T) {
 	ctx := context.Background()
-	m := materializedStore{raw: "raw", index: ".console-topn-test", gaps: []coverageGap{{3000, 4000}}}
+	m := summaryStore{raw: "raw", index: ".console-topn-test", gaps: []coverageGap{{3000, 4000}}}
 	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 4999, Width: 1, N: 1, AllIndices: true}
 	sealed, edges := summaryPlan(m, q, time.UnixMilli(9999999))
 	if !reflect.DeepEqual(sealed, []int64{2000}) || len(edges) != 0 {
@@ -59,10 +59,10 @@ func TestMaterializedRequiresEveryBucket(t *testing.T) {
 	}
 }
 
-func TestMaterializedFailedSearchDoesNotPublish(t *testing.T) {
+func TestSummaryFailedSearchDoesNotPublish(t *testing.T) {
 	ctx := context.Background()
 	q := Query{Cluster: "biz", Source: "index_stats", Min: 2000, Max: 2999, Width: 1, N: 1, AllIndices: true}
-	m := materializedStore{index: ".console-topn-test", raw: "raw"}
+	m := summaryStore{index: ".console-topn-test", raw: "raw"}
 	var writes, closes int
 	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
 		switch {
@@ -80,12 +80,12 @@ func TestMaterializedFailedSearchDoesNotPublish(t *testing.T) {
 			return nil, errors.New("search failed")
 		}
 	}
-	if err := publishTransitionBatches(ctx, call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, []transitionBatch{{materializedMetric(writeRateKey), []int64{2000}}}); err == nil || writes != 0 || closes != 1 {
+	if err := publishTransitionBatches(ctx, call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, []transitionBatch{{summaryMetric(writeRateKey), []int64{2000}}}); err == nil || writes != 0 || closes != 1 {
 		t.Fatalf("err=%v writes=%d closes=%d", err, writes, closes)
 	}
 }
 
-func TestMaterializedTransitionClipsFirstAndLast(t *testing.T) {
+func TestSummaryTransitionClipsFirstAndLast(t *testing.T) {
 	q := Query{Cluster: "biz", Source: "index_stats", Min: 1500, Max: 3500, Width: 1, N: 1, AllIndices: true}
 	s := snapshot{id: "ok", shards: 1, call: func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
 		raw, _ := json.Marshal(body["query"])
@@ -116,7 +116,7 @@ func TestMaterializedTransitionClipsFirstAndLast(t *testing.T) {
 		}
 		return json.Marshal(dsl{"timed_out": false, "_shards": dsl{"total": 1, "successful": 1, "failed": 0}, "aggregations": dsl{"entities": dsl{"buckets": []dsl{{"key": dsl{"entity": "x"}, "dates": dsl{"buckets": parts}}}}}})
 	}}
-	got, err := readTransitions(context.Background(), &s, q, materializedMetric(writeRateKey), []int64{1000, 2000, 3000})
+	got, err := readTransitions(context.Background(), &s, q, summaryMetric(writeRateKey), []int64{1000, 2000, 3000})
 	if err != nil {
 		t.Fatal(err)
 	}

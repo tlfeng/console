@@ -18,17 +18,16 @@ const (
 	summaryJobTimeout   = time.Minute
 	summaryQueueTimeout = 25 * time.Second
 	summaryErrorTTL     = 5 * time.Second
-	summaryJobBytes     = 96 << 20
 )
 
 var (
 	errSummaryPending       = errors.New("TopN is being calculated")
 	errSummaryTargetMissing = errors.New("TopN summary target not found")
-	errSummaryBusy          = errors.New("TopN background queue is full")
+	errSummaryBusy          = errors.New("TopN processing capacity is full")
 )
 
-func summaryPlan(m materializedStore, q Query, now time.Time) (sealed, edges []int64) {
-	full, edgeSet := materializedScopes(q, now.Add(-materializedLag-2*time.Minute).UnixMilli())
+func summaryPlan(m summaryStore, q Query, now time.Time) (sealed, edges []int64) {
+	full, edgeSet := summaryScopes(q, now.Add(-summaryLag-2*time.Minute).UnixMilli())
 	w := int64(q.Width) * 1000
 	for _, st := range full {
 		if m.covered(st-w, st+w-1) {
@@ -51,7 +50,7 @@ func summaryPlan(m materializedStore, q Query, now time.Time) (sealed, edges []i
 	return sealed, edges
 }
 
-func loadSummaries(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, metric Metric, starts []int64, proof rawBucketProof) ([]scoreBucket, error) {
+func loadSummaries(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, starts []int64, proof rawBucketProof) ([]scoreBucket, error) {
 	if len(starts) == 0 {
 		return nil, nil
 	}
@@ -68,15 +67,16 @@ func loadSummaries(ctx context.Context, call caller, api pitAPI, m materializedS
 
 // Each job pins one original view, including the predecessor of each segment.
 // A missing source point is not a failed page and is never persisted as coverage.
-func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, metric Metric, now time.Time, publish bool) error {
-	call = budgetedCaller(call, summaryJobBytes)
+func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, publish bool) error {
+	if publish && m.index == "" {
+		return errSummaryTargetMissing
+	}
 	sealed, edges := summaryPlan(m, q, now)
 	s, err := openRawSummary(ctx, call, m.raw, api)
 	if err != nil {
 		return err
 	}
 	defer s.close()
-	s.responseLimit = summaryJobBytes
 	proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
 	if err != nil {
 		return err
@@ -85,7 +85,8 @@ func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m mat
 	if m.index != "" {
 		all, err = loadSummaries(ctx, call, api, m, q, metric, sealed, proof)
 	}
-	if err != nil && !errors.Is(err, errSummaryMissing) {
+	// A transient calculation can fill an absent cache from the raw PIT.
+	if err != nil && !errors.Is(err, errSummaryMissing) && (publish || !errors.Is(err, errSummaryTargetMissing)) {
 		return err
 	}
 	present := make(map[int64]bool, len(all))
@@ -100,28 +101,26 @@ func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m mat
 	}
 	slices.Sort(todo)
 	var newlyRead []scoreBucket
-	if len(todo) > 0 {
-		for len(todo) > 0 {
-			w := int64(q.Width) * 1000
-			n := 1
-			for n < len(todo) && n < materializedBatch && todo[n]-todo[0] < materializedBatch*w {
-				n++
-			}
-			step, cancel := context.WithTimeout(ctx, 8*time.Second)
-			rows, err := readTransitions(step, s, q, metric, todo[:n])
-			cancel()
-			if err != nil {
-				return err
-			}
-			newlyRead = append(newlyRead, rows...)
-			todo = todo[n:]
+	w := int64(q.Width) * 1000
+	for len(todo) > 0 {
+		n := 1
+		for n < len(todo) && n < summaryBatch && todo[n]-todo[0] < summaryBatch*w {
+			n++
 		}
+		step, cancel := context.WithTimeout(ctx, 8*time.Second)
+		rows, err := readTransitions(step, s, q, metric, todo[:n])
+		cancel()
+		if err != nil {
+			return err
+		}
+		newlyRead = append(newlyRead, rows...)
+		todo = todo[n:]
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	all = append(all, newlyRead...)
-	if err := materializedRank(q, metric, all); err != nil {
+	if err := summaryRank(q, metric, all); err != nil {
 		return err
 	}
 	if publish && q.AllIndices {
@@ -157,7 +156,7 @@ type summaryQueue struct {
 
 var onDemandSummaries = summaryQueue{jobs: make(map[string]*summaryJob), running: make(chan struct{}, 1)}
 
-func summaryJobKey(m materializedStore, q Query, metric Metric) string {
+func summaryJobKey(m summaryStore, q Query, metric Metric) string {
 	acl := append([]string(nil), q.Indices...)
 	if q.AllIndices {
 		acl = nil
@@ -258,7 +257,7 @@ func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Co
 	return errSummaryPending
 }
 
-func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, metric Metric, now time.Time, key string) (bool, error) {
+func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, key string) (bool, error) {
 	var expected string
 	copyItem := *metric.Item
 	cached := metric
@@ -272,9 +271,8 @@ func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m materiali
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
-		return true, errSummaryPending
+		return true, errSummaryBusy
 	}
-	call = budgetedCaller(call, responseLimit)
 	s, err := openRawSummary(ctx, call, m.raw, api)
 	if err != nil {
 		return true, err
@@ -304,26 +302,31 @@ func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m materiali
 	return true, nil
 }
 
-func readOnDemand(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, metric Metric, now time.Time, writer, poll bool) error {
-	if api.path == "" {
-		return errUnavailable
-	}
-	key := summaryJobKey(m, q, metric)
-	err := readMaterialized(ctx, call, api, m, q, metric, now)
-	if !poll || !writer || q.Max > now.UnixMilli() {
+func canPublishSummary(cfg summaryConfig, q Query, metric Metric) bool {
+	return cfg.writes() && q.AllIndices && slices.Contains(cfg.metricKeys(), metric.Item.Key)
+}
+
+func readOnDemand(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, cfg summaryConfig, poll bool) error {
+	err := readSummary(ctx, call, api, m, q, metric, now)
+	if !poll || !cfg.writes() {
 		return err
 	}
 	if !errors.Is(err, errSummaryTargetMissing) && !errors.Is(err, errSummaryMissing) {
 		return err
 	}
-	return onDemandSummaries.submit(key, metric, func(ctx context.Context, mx Metric) error {
-		target := m
-		initErr := ensureSummaryIndex(ctx, budgetedCaller(call, responseLimit), m, api)
-		if errors.Is(initErr, errSummaryNoPolicy) {
-			target.index = ""
-		} else if initErr != nil {
-			return initErr
-		}
-		return computeMissingSummaries(ctx, call, api, target, q, mx, now, target.index != "")
+	publish := canPublishSummary(cfg, q, metric)
+	return onDemandSummaries.submit(summaryJobKey(m, q, metric), metric, func(ctx context.Context, mx Metric) error {
+		return computeOnDemand(ctx, call, api, m, q, mx, now, publish)
 	})
+}
+
+func computeOnDemand(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, publish bool) error {
+	if publish {
+		if err := ensureSummaryIndex(ctx, call, m, api); errors.Is(err, errSummaryNoPolicy) {
+			publish = false
+		} else if err != nil {
+			return err
+		}
+	}
+	return computeMissingSummaries(ctx, call, api, m, q, metric, now, publish)
 }

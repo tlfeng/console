@@ -35,7 +35,6 @@ func selectEntities(q Query, names string) []string {
 }
 
 func runSelected(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
-	call = budgetedCaller(call, responseLimit)
 	if q.Source == "node_stats" && metric.mode.difference() {
 		summary := metric
 		summary.jvmSummary = true

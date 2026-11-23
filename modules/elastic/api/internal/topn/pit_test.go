@@ -123,3 +123,70 @@ func TestQueryRouting(t *testing.T) {
 		})
 	}
 }
+
+func TestSummaryRoutingUsesSystemStorePIT(t *testing.T) {
+	q := Query{Cluster: "biz", Source: "index_stats", Min: 10800 * 1000, Width: 10800, N: 1, AllIndices: true}
+	q.Max = q.Min + 15*86400000 - 1
+	var cfg config
+	cfg.TopN.RawIndex = "raw"
+	cfg.TopN.Summary.Enabled = true
+	for _, tc := range []struct {
+		name    string
+		version elastic.Version
+		gap     string
+		want    []string
+		status  string
+	}{
+		{"older Elasticsearch", elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.15.5"}, "", []string{"single"}, ""},
+		{"older OpenSearch with unrelated gap", elastic.Version{Distribution: elastic.Opensearch, Number: "2.3.0"}, "2000000000", []string{"single"}, ""},
+		{"older Elasticsearch with baseline gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "5000", nil, "summary_unavailable"},
+		{"older Elasticsearch with invalid gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "invalid", nil, "summary_unavailable"},
+		{"strict PIT fails", elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.16.0"}, "", []string{"raw metadata", "open", "close"}, "query_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			call := func(_ context.Context, method, path string, _ dsl) ([]byte, error) {
+				switch {
+				case method == http.MethodGet && strings.HasPrefix(path, "/raw/_settings/index.uuid?"):
+					calls = append(calls, "raw metadata")
+					return []byte(`{"raw":{"settings":{"index.uuid":"original"}}}`), nil
+				case method == http.MethodPost && strings.HasPrefix(path, "/raw/_pit?"):
+					calls = append(calls, "open")
+					return []byte(`{"id":"partial","_shards":{"total":3,"successful":2,"failed":1}}`), nil
+				case method == http.MethodDelete && path == "/_pit":
+					calls = append(calls, "close")
+					return []byte(`{"succeeded":true}`), nil
+				case method == http.MethodPost && strings.HasPrefix(path, "/raw/_search?"):
+					calls = append(calls, "single")
+					return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
+				}
+				t.Fatalf("unexpected request %s %s", method, path)
+				return nil, nil
+			}
+			cfg := cfg
+			if tc.gap != "" {
+				cfg.TopN.Summary.Gaps = []struct {
+					From  string `config:"from"`
+					Until string `config:"until"`
+				}{{tc.gap, "2000000010"}}
+			}
+			store := func() (caller, elastic.Version, string) { return call, tc.version, "test" }
+			err := calculateWithConfig(context.Background(), q, summaryMetric(queryRateKey), true, cfg, store)
+			if tc.status == "" && err != nil || tc.status != "" && (err == nil || failureStatus(err) != tc.status) {
+				t.Fatalf("err=%v, want status %q", err, tc.status)
+			}
+			if !reflect.DeepEqual(calls, tc.want) {
+				t.Fatalf("calls=%v, want %v", calls, tc.want)
+			}
+		})
+	}
+
+	q.AllIndices = false
+	store := func() (caller, elastic.Version, string) {
+		t.Fatal("no monitoring store should be opened for an empty summary ACL")
+		return nil, elastic.Version{}, ""
+	}
+	if err := calculateWithConfig(context.Background(), q, summaryMetric(queryRateKey), true, cfg, store); err != nil {
+		t.Fatalf("empty ACL should remain an empty result: %v", err)
+	}
+}

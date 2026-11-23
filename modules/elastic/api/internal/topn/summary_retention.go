@@ -197,7 +197,7 @@ func summaryProofStarts(sealed, edges []int64) []int64 {
 
 // Recheck with a fresh raw PIT before publishing; an old PIT can still hold
 // references to a backing index removed from the live alias during computation.
-func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, sets [][]scoreBucket, batches []transitionBatch, original rawBucketProof) error {
+func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, sets [][]scoreBucket, batches []transitionBatch, original rawBucketProof) error {
 	width := int64(q.Width) * 1000
 	var starts []int64
 	for _, set := range sets {

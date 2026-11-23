@@ -105,6 +105,8 @@ func TestFailureStatus(t *testing.T) {
 		err  error
 		want string
 	}{
+		{errSummaryPending, "pending"},
+		{fmt.Errorf("search: %w", errSummaryBusy), "busy"},
 		{errRawHistory, "history_unavailable"},
 		{fmt.Errorf("search: %w", errBudget), "budget_exceeded"},
 		{context.DeadlineExceeded, "timed_out"},
@@ -117,6 +119,37 @@ func TestFailureStatus(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got) != 1 || got["topn_status"] != tc.want {
 			t.Fatalf("%v: response %s, want only status %q", tc.err, w.Body, tc.want)
 		}
+	}
+}
+
+func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
+	for i := 0; i < cap(slots); i++ {
+		slots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(slots); i++ {
+			<-slots
+		}
+	}()
+	var cfg config
+	cfg.TopN.RawIndex = "raw"
+	store := func() (caller, elastic.Version, string) {
+		return func(context.Context, string, string, dsl) ([]byte, error) {
+			t.Fatal("no backend request should run")
+			return nil, nil
+		}, elastic.Version{}, "test"
+	}
+	q := Query{Source: "node_stats", Min: 1000, Max: 1999, Width: 1, N: 1}
+	metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
+	for _, selected := range [][]string{nil, {"node"}} {
+		q.selected = selected
+		if err := calculateWithConfig(context.Background(), q, metric, false, cfg, store); !errors.Is(err, errSummaryBusy) {
+			t.Fatalf("selection %v: slot saturation must be retryable, got %v", selected, err)
+		}
+	}
+	q.Max = q.Min + 512*1000 // 513 visible buckets.
+	if err := calculateWithConfig(context.Background(), q, metric, false, cfg, store); !errors.Is(err, errBudget) {
+		t.Fatalf("oversized windows must still fail the structural budget: %v", err)
 	}
 }
 

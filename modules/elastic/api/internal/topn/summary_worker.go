@@ -15,12 +15,12 @@ import (
 )
 
 const (
-	materializedBatch = 8
-	materializedTask  = "console-topn-materialized-v1"
+	summaryBatch  = 8
+	summaryTaskID = "console-topn-summary-v1"
 )
 
 func newScoreBucket(start int64) scoreBucket {
-	return scoreBucket{Version: materializedVersion, Start: start, Names: []string{}, Scores: []float64{}}
+	return scoreBucket{Version: summaryVersion, Start: start, Names: []string{}, Scores: []float64{}}
 }
 
 // readTransitions builds only requested transitions, using each original interval
@@ -79,9 +79,14 @@ func readTransitionBatches(ctx context.Context, s *snapshot, q Query, batches []
 		for j, batch := range batches {
 			projection := projections[j]
 			for i, ts := range batch.starts {
-				if v, ok := counterPoint(projection.sample(byTime[ts-w]), projection.sample(byTime[ts]), w, batch.metric.mode, false); ok {
+				a, b := byTime[ts-w].project(batch.metric, projection), byTime[ts].project(batch.metric, projection)
+				v, ok, err := counterPoint(a, b, w, batch.metric, false)
+				if err != nil {
+					return err
+				}
+				if ok {
 					bucket := &out[j][i]
-					if len(bucket.Names) >= materializedEntityLimit {
+					if len(bucket.Names) >= summaryEntityLimit {
 						return errBudget
 					}
 					bucket.Names = append(bucket.Names, name)
@@ -104,7 +109,7 @@ func readTransitionBatches(ctx context.Context, s *snapshot, q Query, batches []
 	return out, nil
 }
 
-func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, metric Metric, now time.Time) error {
+func readSummary(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time) error {
 	if api.path == "" {
 		return errUnavailable
 	}
@@ -118,7 +123,6 @@ func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializ
 	if len(edges) > 5 {
 		return errBudget
 	}
-	call = budgetedCaller(call, responseLimit)
 	s, err := openRawSummary(ctx, call, m.raw, api)
 	if err != nil {
 		return err
@@ -143,13 +147,10 @@ func readMaterialized(ctx context.Context, call caller, api pitAPI, m materializ
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return materializedRank(q, metric, all)
+	return summaryRank(q, metric, all)
 }
 
-// Only an administrator-provisioned concrete index with this mapping marker
-// may be written by the worker. In particular, an alias is not a target.
-
-func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m materializedStore, q Query, batches []transitionBatch) error {
+func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, batches []transitionBatch) error {
 	w := int64(q.Width) * 1000
 	if len(batches) == 0 {
 		return nil
@@ -161,7 +162,7 @@ func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m ma
 			}
 		}
 	}
-	s, err := openRawSummary(ctx, budgetedCaller(call, responseLimit), m.raw, api)
+	s, err := openRawSummary(ctx, call, m.raw, api)
 	if err != nil {
 		return err
 	}
@@ -181,7 +182,7 @@ func publishTransitionBatches(ctx context.Context, call caller, api pitAPI, m ma
 	return publishProvenBuckets(ctx, call, api, m, q, sets, batches, proof)
 }
 
-func missingMaterialized(ctx context.Context, call caller, m materializedStore, q Query, keys []string, starts []int64, proof rawBucketProof) (map[string][]int64, error) {
+func missingSummaries(ctx context.Context, call caller, m summaryStore, q Query, keys []string, starts []int64, proof rawBucketProof) (map[string][]int64, error) {
 	eligible := make([]int64, 0, len(starts))
 	for _, st := range starts {
 		if proof.transition(st, int64(q.Width)*1000) != "" {
@@ -245,20 +246,19 @@ func missingMaterialized(ctx context.Context, call caller, m materializedStore, 
 	return missing, nil
 }
 
-func materializedTick(ctx context.Context, call caller, api pitAPI, m materializedStore, clusters, keys []string, now time.Time) error {
+func summaryTick(ctx context.Context, call caller, api pitAPI, m summaryStore, clusters, keys []string, now time.Time) error {
 	if api.path == "" {
 		return errUnavailable
 	}
-	call = budgetedCaller(call, 64<<20)
-	if err := checkMaterializedIndex(ctx, call, m); err != nil {
+	if err := checkSummaryIndex(ctx, call, m); err != nil {
 		return err
 	}
 	var batchErrors []error
 	for _, cluster := range clusters {
 		for _, width := range []int{10800, 14400, 21600, 28800} {
 			w := int64(width) * 1000
-			end := now.Add(-materializedLag).UnixMilli() / w * w
-			begin := max(now.AddDate(0, 0, -materializedDays).UnixMilli()/w*w, w)
+			end := now.Add(-summaryLag).UnixMilli() / w * w
+			begin := max(now.AddDate(0, 0, -summaryDays).UnixMilli()/w*w, w)
 			q := Query{Cluster: cluster, Source: "index_stats", Width: width, AllIndices: true}
 			var starts []int64
 			for st := end - w; st >= begin; st -= w {
@@ -278,74 +278,95 @@ func materializedTick(ctx context.Context, call caller, api pitAPI, m materializ
 			if err != nil {
 				return err
 			}
-			missing, err := missingMaterialized(ctx, call, m, q, keys, starts, proof)
+			missing, err := missingSummaries(ctx, call, m, q, keys, starts, proof)
 			if err != nil {
 				return err
 			}
-			// Select one bounded recent span across metrics. Each metric publishes
-			// only the missing buckets from that span, not existing documents.
-			var latest int64
-			for _, values := range missing {
-				if len(values) > 0 {
-					latest = max(latest, values[0])
-				}
-			}
-			if latest == 0 {
-				continue
-			}
-			first := latest - (materializedBatch-1)*w
-			var batches []transitionBatch
+			// Keep the script-free rates independent of latency script failures.
+			var rateBatches, latencyBatches []transitionBatch
 			for _, key := range keys {
 				selected := missing[key]
-				for len(selected) > 0 && selected[len(selected)-1] < first {
-					selected = selected[:len(selected)-1]
-				}
 				if len(selected) == 0 {
 					continue
 				}
-				slices.Reverse(selected)
-				batches = append(batches, transitionBatch{materializedMetric(key), selected})
+				batch := transitionBatch{summaryMetric(key), selected}
+				if batch.metric.mode == latency {
+					latencyBatches = append(latencyBatches, batch)
+				} else {
+					rateBatches = append(rateBatches, batch)
+				}
 			}
-			q.Min, q.Max = first, latest+w-1
-			if err = publishTransitionBatches(ctx, call, api, m, q, batches); err != nil {
-				batchErrors = append(batchErrors, fmt.Errorf("TopN %s/%ds: %w", cluster, width, err))
+			for _, batches := range [][]transitionBatch{rateBatches, latencyBatches} {
+				if len(batches) == 0 {
+					continue
+				}
+				var latest int64
+				for _, batch := range batches {
+					latest = max(latest, batch.starts[0])
+				}
+				first := latest - (summaryBatch-1)*w
+				selected := batches[:0]
+				for _, batch := range batches {
+					for len(batch.starts) > 0 && batch.starts[len(batch.starts)-1] < first {
+						batch.starts = batch.starts[:len(batch.starts)-1]
+					}
+					if len(batch.starts) > 0 {
+						slices.Reverse(batch.starts)
+						selected = append(selected, batch)
+					}
+				}
+				q.Min, q.Max = first, latest+w-1
+				if err = publishTransitionBatches(ctx, call, api, m, q, selected); err != nil {
+					batchErrors = append(batchErrors, fmt.Errorf("TopN %s/%ds: %w", cluster, width, err))
+				}
 			}
 		}
 	}
 	return errors.Join(batchErrors...)
 }
 
-func StartMaterialized() {
+func (c summaryConfig) validateBackfillClusters() error {
+	if !c.Enabled && len(c.Clusters) > 4 {
+		return errors.New("TopN scheduled backfill supports at most four configured clusters")
+	}
+	return nil
+}
+
+func StartSummary() {
 	var cfg config
-	if _, err := env.ParseConfig("insight", &cfg); err != nil || !cfg.TopN.Materialized.writes() || (!cfg.TopN.Materialized.Enabled && len(cfg.TopN.Materialized.Clusters) == 0) {
+	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return
 	}
-	if len(cfg.TopN.Materialized.Clusters) > 4 {
-		log.Warn("TopN materialization supports at most four configured clusters")
+	sc := cfg.TopN.Summary
+	if !sc.writes() || (!sc.Enabled && len(sc.Clusters) == 0) {
 		return
 	}
-	task.RegisterScheduleTask(task.ScheduleTask{ID: materializedTask, Interval: "1m", Singleton: true, Task: func(ctx context.Context) {
+	if err := sc.validateBackfillClusters(); err != nil {
+		log.Warn(err)
+		return
+	}
+	task.RegisterScheduleTask(task.ScheduleTask{ID: summaryTaskID, Interval: "1m", Singleton: true, Task: func(ctx context.Context) {
 		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
 		index, err := cfg.rawSource()
 		if err == nil {
-			var m materializedStore
-			m, err = cfg.TopN.Materialized.store(index)
+			var m summaryStore
+			m, err = sc.store(index)
 			if err == nil {
 				call, version, _ := monitoredStore()
 				if call == nil {
 					err = errUnavailable
 				} else if api := pitFor(version); api.path != "" {
-					if cfg.TopN.Materialized.Enabled {
-						err = ensureSummaryIndex(ctx, budgetedCaller(call, responseLimit), m, api)
+					if sc.Enabled {
+						err = ensureSummaryIndex(ctx, call, m, api)
 					} else {
-						err = materializedTick(ctx, call, api, m, cfg.TopN.Materialized.Clusters, cfg.TopN.Materialized.metricKeys(), time.Now().UTC())
+						err = summaryTick(ctx, call, api, m, sc.Clusters, sc.metricKeys(), time.Now().UTC())
 					}
 				}
 			}
 		}
 		if err != nil && !errors.Is(err, errSummaryNoPolicy) {
-			log.Warnf("materialize monitoring TopN: %v", err)
+			log.Warnf("maintain TopN summaries: %v", err)
 		}
 	}})
 }

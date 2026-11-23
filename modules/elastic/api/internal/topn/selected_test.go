@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http/httptest"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -28,24 +27,32 @@ func TestServeSelectedAllDenied(t *testing.T) {
 	q := Query{Source: "index_stats", Width: 1, Indices: []string{"public-*"}}
 	r := httptest.NewRequest("GET", "/?min=1000&max=2000&top=not-used", nil)
 	w := httptest.NewRecorder()
-	ServeSelected(w, r, q, materializedMetric(writeRateKey), "private,_all")
+	ServeSelected(w, r, q, summaryMetric(writeRateKey), "private,_all")
 	if got := w.Body.String(); !strings.Contains(got, `"metrics":{"indexing_rate":`) || strings.Contains(got, `"topn_status"`) {
 		t.Fatalf("want ordinary empty chart, got %s", got)
 	}
 }
 
-func TestSelectedSearchBudgetRejectsBeforeQuery(t *testing.T) {
+func TestSelectedSearchUsesFullBucketCapacity(t *testing.T) {
 	q := Query{Source: "index_stats", Min: 1000, Max: 512000, Width: 1, AllIndices: true}
-	for i := range 5 {
-		q.selected = append(q.selected, "idx-"+strconv.Itoa(i))
-	}
+	q.selected = []string{"idx-0", "idx-1", "idx-2"}
 	pred, _ := q.filter()
-	call := func(context.Context, string, string, dsl) ([]byte, error) {
-		t.Fatal("unexpected query")
-		return nil, nil
+	m := summaryMetric(writeRateKey)
+	calls := 0
+	call := func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
+		calls++
+		entities := body["aggs"].(dsl)["scan"].(dsl)["aggs"].(dsl)["entities"].(dsl)
+		if got := entities["terms"].(dsl)["size"]; got != 3 {
+			t.Fatalf("selected query requested %v terms, want 3", got)
+		}
+		return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
 	}
-	m := materializedMetric(writeRateKey)
-	if err := singleSearch(context.Background(), call, "raw", pred, q, m); !errors.Is(err, errBudget) || len(m.Item.Lines) != 0 {
-		t.Fatalf("err=%v lines=%v", err, m.Item.Lines)
+	if err := singleSearch(context.Background(), call, "raw", pred, q, m); err != nil || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	q.selected = append(q.selected, "idx-3")
+	pred, _ = q.filter()
+	if err := singleSearch(context.Background(), call, "raw", pred, q, m); !errors.Is(err, errBudget) || calls != 1 {
+		t.Fatalf("over-capacity selection: err=%v calls=%d", err, calls)
 	}
 }

@@ -3,33 +3,27 @@ package topn
 import (
 	"context"
 	"errors"
+	"math"
 )
 
 const (
-	pageSize  = 64
-	maxPages  = 48
-	maxPoints = 150000
+	searchBucketLimit = 6000
+	pageSize          = 64
+	maxPages          = 48
+	maxPoints         = 150000
 )
 
 type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time   *int64  `json:"key"`
-	Count  int     `json:"doc_count"`
-	Value  *scalar `json:"value"`
-	Other  *scalar `json:"other"`
-	Extra1 *scalar `json:"extra1"`
-	Extra2 *scalar `json:"extra2"`
-	Ratio  *struct {
-		Hits struct {
-			Rows []struct {
-				Fields map[string][]float64 `json:"fields"`
-			} `json:"hits"`
-		} `json:"hits"`
-	} `json:"ratio_samples"`
-	JVM       *jvmHits `json:"jvm_lifetime"`
-	JVMLegacy *struct {
+	Time       *int64     `json:"key"`
+	Count      int        `json:"doc_count"`
+	Value      *scalar    `json:"value"`
+	Other      *scalar    `json:"other"`
+	Pair       *pairedHit `json:"pair"`
+	SecondPair *pairedHit `json:"second_pair"`
+	JVMLegacy  *struct {
 		Count int      `json:"doc_count"`
 		JVM   *jvmHits `json:"jvm_lifetime"`
 	} `json:"jvm_legacy"`
@@ -61,36 +55,64 @@ func (p samples) entity() string {
 	return p.Identity.Buckets[0].Key
 }
 
-func counterPoint(previous, current samples, width int64, mode metricMode, node bool) (float64, bool) {
-	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width || previous.Value == nil || current.Value == nil || previous.Value.Value == nil || current.Value.Value == nil {
-		return 0, false
+type pairedHit struct {
+	Hits struct {
+		Rows []struct {
+			Fields map[string][]float64 `json:"fields"`
+		} `json:"hits"`
+	} `json:"hits"`
+}
+
+func (p samples) counterValues(metric Metric) (value, operations float64, ok bool, err error) {
+	if metric.mode != latency {
+		value, ok = number(p.Value)
+		return value, 0, ok, nil
+	}
+	if p.Pair == nil || len(p.Pair.Hits.Rows) != 1 {
+		return 0, 0, false, errors.New("incomplete TopN latency observation")
+	}
+	fields := p.Pair.Hits.Rows[0].Fields
+	a, b := fields[metric.Field], fields[metric.Field2]
+	if len(a) != 1 || len(b) != 1 || !validCounter(a[0]) || !validCounter(b[0]) {
+		return 0, 0, false, nil
+	}
+	return a[0], b[0], true, nil
+}
+
+func validCounter(v float64) bool {
+	return v >= 0 && !math.IsInf(v, 0)
+}
+
+func counterPoint(previous, current samples, width int64, metric Metric, node bool) (float64, bool, error) {
+	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width {
+		return 0, false, nil
 	}
 	id := previous.entity()
 	if id == "" || id != current.entity() {
-		return 0, false
+		return 0, false, nil
 	}
 	if node && !sameJVMLifetime(previous, current) {
-		return 0, false
+		return 0, false, nil
 	}
 	if !node && (changed(previous.Shards, current.Shards) || changed(previous.Replicas, current.Replicas)) {
-		return 0, false
+		return 0, false, nil
 	}
 
-	a, b := *previous.Value.Value, *current.Value.Value
-	if a < 0 || b < a {
-		return 0, false
+	a, c, ok, err := previous.counterValues(metric)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	if mode != latency {
-		return (b - a) / (float64(width) / 1000), true
+	b, d, ok, err := current.counterValues(metric)
+	if err != nil || !ok || b < a {
+		return 0, false, err
 	}
-	if previous.Other == nil || current.Other == nil || previous.Other.Value == nil || current.Other.Value == nil {
-		return 0, false
+	if metric.mode != latency {
+		return (b - a) / (float64(width) / 1000), true, nil
 	}
-	c, d := *previous.Other.Value, *current.Other.Value
-	if c < 0 || d <= c {
-		return 0, false
+	if d <= c {
+		return 0, false, nil
 	}
-	return (b - a) / (d - c), true
+	return (b - a) / (d - c), true, nil
 }
 
 const (
@@ -103,11 +125,8 @@ const (
 // The node's own timestamp and uptime share a clock. Reject a bucket if
 // its lifetime evidence is missing or truncated, even as a baseline.
 func (p samples) jvmLifetime() (int64, int64, bool) {
-	if p.Count <= 0 {
+	if p.Count <= 0 || p.JVMCount == nil {
 		return 0, 0, false
-	}
-	if p.JVMCount == nil {
-		return hitJVMLifetime(p.JVM, p.Count)
 	}
 	legacy := 0
 	if p.JVMLegacy != nil {
@@ -178,11 +197,6 @@ type winner struct {
 	points [][]interface{}
 }
 
-func (q Query) previousBucket() int64 {
-	w := int64(q.Width) * 1000
-	return q.Min/w*w - w
-}
-
 func (q Query) counterScope() dsl {
 	width := int64(q.Width) * 1000
 	first := q.Min / width * width
@@ -194,22 +208,63 @@ func (q Query) counterScope() dsl {
 	return dsl{"bool": dsl{"should": scope, "minimum_should_match": 1}}
 }
 
-const ratioSampleLimit = 100 // Default index.max_inner_result_window.
+// Both aggregations work on doc values from the same observation. A numeric
+// sort after the validity flag keeps large operation counts in their native type.
+const pairedNumbers = `
+if (!doc.containsKey(params.first) || !doc.containsKey(params.second) ||
+    doc[params.first].size() != 1 || doc[params.second].size() != 1) return -1;
+double a = doc[params.first].value;
+double b = doc[params.second].value;
+if (!(a >= 0 && a <= 1.7976931348623157E308 && b >= 0 && b <= 1.7976931348623157E308)) return -1;
+`
+
+func pairedScript(first, second, source string) dsl {
+	return dsl{"lang": "painless", "source": pairedNumbers + source, "params": dsl{"first": first, "second": second}}
+}
+
+func ratioMaximum(metric Metric) dsl {
+	a, b := metric.Field, metric.Field2
+	if metric.reverseRatio {
+		a, b = b, a
+	}
+	return dsl{"max": dsl{"script": pairedScript(a, b, `
+if (b <= 0) return -1;
+double value = a / b * 100.0;
+return value <= 1.7976931348623157E308 ? value : -1;
+`)}}
+}
+
+func latencyPair(metric Metric) dsl {
+	return dsl{"top_hits": dsl{
+		"size": 1, "_source": false, "stored_fields": "_none_",
+		"docvalue_fields": []string{metric.Field, metric.Field2},
+		"sort": []dsl{
+			{"_script": dsl{"type": "number", "order": "desc", "script": pairedScript(metric.Field, metric.Field2, "return 1;")}},
+			{metric.Field2: dsl{"order": "desc", "unmapped_type": "long"}},
+			{"timestamp": dsl{"order": "desc", "unmapped_type": "date"}},
+			{metric.Field: dsl{"order": "desc", "unmapped_type": "long"}},
+		},
+	}}
+}
 
 func metricAggs(q Query, metric Metric) dsl {
-	if metric.mode == ratio {
-		return dsl{"ratio_samples": dsl{"top_hits": dsl{
-			"size": ratioSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
-			"docvalue_fields": []string{metric.Field, metric.Field2},
-		}}}
+	switch metric.mode {
+	case ratio:
+		return dsl{"value": ratioMaximum(metric)}
+	case peak:
+		return dsl{"value": maximum(metric.Field)}
 	}
-	buckets := dsl{"value": maximum(metric.Field)}
-	if metric.Field2 != "" {
-		buckets["other"] = maximum(metric.Field2)
+	buckets := counterEvidence(q, metric.jvmSummary)
+	if metric.mode == latency {
+		buckets["pair"] = latencyPair(metric)
+	} else {
+		buckets["value"] = maximum(metric.Field)
 	}
-	if !metric.mode.difference() {
-		return buckets
-	}
+	return buckets
+}
+
+func counterEvidence(q Query, jvmSummary bool) dsl {
+	buckets := dsl{}
 	node := q.Source == "node_stats"
 	identity := "metadata.labels.index_uuid"
 	if node {
@@ -220,7 +275,7 @@ func metricAggs(q Query, metric Metric) dsl {
 		buckets["jvm_start_min"] = dsl{"min": dsl{"field": jvmStart}}
 		buckets["jvm_start_max"] = maximum(jvmStart)
 		buckets["jvm_start_count"] = dsl{"value_count": dsl{"field": jvmStart}}
-		if !metric.jvmSummary {
+		if !jvmSummary {
 			buckets["jvm_legacy"] = dsl{"filter": withoutJVMStart(), "aggs": dsl{"jvm_lifetime": dsl{"top_hits": dsl{
 				"size": jvmSampleLimit, "_source": false, "stored_fields": "_none_", "sort": []string{"_doc"},
 				"docvalue_fields": []string{jvmTimestamp, jvmUptime},
@@ -254,7 +309,7 @@ func keepWinner(best []winner, candidate winner, n int) []winner {
 
 func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
 	best := make([]winner, 0, q.N)
-	err := visitCounterBuckets(ctx, s, q, pred, metric, metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples) error {
+	err := visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples) error {
 		candidate, err := scoreSeries(q, metric, name, points)
 		if err == nil {
 			best = keepWinner(best, candidate, q.N)
@@ -270,17 +325,10 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
-func visitCounterBuckets(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric, scope dsl, cost int, visit func(string, []samples) error) error {
-	return visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), scope, cost, visit)
-}
-
 func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost int, visit func(string, []samples) error) error {
 	pred["filter"] = append(pred["filter"].([]dsl), scope)
-	size := pageSize
 	// Leave headroom for per-point identity buckets plus their histogram parents.
-	if limit := 6000 / (cost + 1); limit < size {
-		size = limit
-	}
+	size := min(pageSize, searchBucketLimit/(cost+1))
 	if size < 1 {
 		return errBudget
 	}

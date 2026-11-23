@@ -146,7 +146,7 @@ export default (props) => {
                       {
                         item[1].map((metricKey) => (
                           <MetricChart
-                            advancedTopN={props.advancedTopN}
+                            advancedTopN={props.advancedTopN && metricKey !== "doc_percent"}
                             key={metricKey} 
                             instance={charts[metricKey]} 
                             pointerUpdate={pointerUpdate}

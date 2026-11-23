@@ -16,7 +16,7 @@ func summaryGeneration(alias, name string) bool {
 	return ok && generationSuffix.MatchString(suffix)
 }
 
-func checkMaterializedIndex(ctx context.Context, call caller, m materializedStore) error {
+func checkSummaryIndex(ctx context.Context, call caller, m summaryStore) error {
 	raw, err := call(ctx, http.MethodGet, "/"+m.index+"/_mapping", nil)
 	if err != nil {
 		return err
@@ -32,7 +32,7 @@ func checkMaterializedIndex(ctx context.Context, call caller, m materializedStor
 		return errors.New("unexpected TopN summary index mapping")
 	}
 	for name, row := range mapping {
-		if (name != m.index && !summaryGeneration(m.index, name)) || row.Mappings.Meta.Version != materializedVersion {
+		if (name != m.index && !summaryGeneration(m.index, name)) || row.Mappings.Meta.Version != summaryVersion {
 			return errors.New("unexpected TopN summary index mapping")
 		}
 	}
@@ -83,7 +83,7 @@ func writeBacking(indices map[string]backingIndex, target string) (string, error
 
 // Prevent a disappeared rollover alias from being auto-created as a concrete
 // index by a score write. Existing concrete caches keep their original path.
-func summaryWriteSuffix(ctx context.Context, call caller, m materializedStore) (string, error) {
+func summaryWriteSuffix(ctx context.Context, call caller, m summaryStore) (string, error) {
 	targets, err := backingSettings(ctx, call, m.index)
 	if err != nil {
 		return "", err
@@ -128,8 +128,8 @@ func ismPolicy(ctx context.Context, call caller, name string) (string, error) {
 var errSummaryNoPolicy = errors.New("raw monitoring index has no lifecycle policy")
 var errSummaryPolicyChanged = errors.New("monitoring lifecycle policy changed; use a new TopN summary name")
 
-func ensureSummaryIndex(ctx context.Context, call caller, m materializedStore, api pitAPI) error {
-	err := checkMaterializedIndex(ctx, call, m)
+func ensureSummaryIndex(ctx context.Context, call caller, m summaryStore, api pitAPI) error {
+	err := checkSummaryIndex(ctx, call, m)
 	missing := errors.Is(err, monitoringHTTPError(404))
 	if err != nil && !missing {
 		return err
@@ -176,7 +176,7 @@ func ensureSummaryIndex(ctx context.Context, call caller, m materializedStore, a
 	settings[aliasSetting] = m.index
 	// Bind the bootstrap to the discovered policy, and persist that identity in
 	// every generation's mapping. ISM attaches the policy separately.
-	mapping := dsl{"dynamic": false, "_meta": dsl{"console_topn": materializedVersion, "raw_policy": policy}, "properties": dsl{"t": dsl{"type": "date", "format": "epoch_millis"}}}
+	mapping := dsl{"dynamic": false, "_meta": dsl{"console_topn": summaryVersion, "raw_policy": policy}, "properties": dsl{"t": dsl{"type": "date", "format": "epoch_millis"}}}
 	if missing {
 		bootstrap := m.index + "-000001"
 		if _, err = call(ctx, http.MethodHead, "/"+bootstrap, nil); !errors.Is(err, monitoringHTTPError(404)) {
@@ -196,7 +196,7 @@ func ensureSummaryIndex(ctx context.Context, call caller, m materializedStore, a
 		if _, err = call(ctx, http.MethodPut, "/"+bootstrap, body); err != nil && !errors.Is(err, monitoringHTTPError(400)) && !errors.Is(err, monitoringHTTPError(409)) {
 			return err
 		}
-		if err = checkMaterializedIndex(ctx, call, m); err != nil {
+		if err = checkSummaryIndex(ctx, call, m); err != nil {
 			return err
 		}
 		targets, err = backingSettings(ctx, call, m.index)
@@ -244,7 +244,7 @@ func ensureSummaryIndex(ctx context.Context, call caller, m materializedStore, a
 	return nil
 }
 
-func verifySummaryTemplate(ctx context.Context, call caller, m materializedStore, aliasSetting, policy string, ism bool) error {
+func verifySummaryTemplate(ctx context.Context, call caller, m summaryStore, aliasSetting, policy string, ism bool) error {
 	wire, err := call(ctx, http.MethodPost, "/_index_template/_simulate_index/"+m.index+"-000002", nil)
 	if err != nil {
 		return err
@@ -267,7 +267,7 @@ func verifySummaryTemplate(ctx context.Context, call caller, m materializedStore
 	if meta.Policy != policy {
 		return errSummaryPolicyChanged
 	}
-	if meta.Version != materializedVersion || settingValue(response.Template.Settings, aliasSetting) != m.index || !ism && settingValue(response.Template.Settings, "index.lifecycle.name") != policy {
+	if meta.Version != summaryVersion || settingValue(response.Template.Settings, aliasSetting) != m.index || !ism && settingValue(response.Template.Settings, "index.lifecycle.name") != policy {
 		return errors.New("effective TopN rollover template does not inherit the monitoring policy")
 	}
 	return nil

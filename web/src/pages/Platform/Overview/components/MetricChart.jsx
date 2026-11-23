@@ -1,6 +1,7 @@
 import request, { formatResponse } from "@/utils/request";
 import { cloneDeep } from "lodash";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { formatTimeRange } from "@/lib/elasticsearch/util";
 import { formatMessage } from "umi/locale";
 import styles from "./Metrics.scss";
 import { Alert, Dropdown, Empty, Icon, Menu, message, Spin, Tooltip } from "antd";
@@ -41,15 +42,13 @@ export default (props) => {
       instance,
       pointerUpdate,
       handleTimeIntervalChange,
-      advancedTopN
+      advancedTopN = false
     } = props;
   
     const [loading, setLoading] = useState(false)
 
     const [metric, setMetric] = useState()
   
-    const [isInView, setIsInView] = useState(false);
-
     const [error, setError] = useState();
   
     const observerRef = useRef({ isInView: false })
@@ -57,133 +56,208 @@ export default (props) => {
     const containerRef = useRef(null)
   
     const firstFetchRef = useRef(true)
-    const activeRequestRef = useRef()
-    const fetchDataRef = useRef()
-    const pendingRequestRef = useRef()
+    const activeTopNRef = useRef()
 
     const [timeInterval, setTimeInterval] = useState()
-  
+
     const { min: queryMin, max: queryMax, ...selection } = queryParams || {}
-    // A tick re-resolves a relative range. Its pending job keeps the absolute
-    // bounds from submission; a change to the selection or range cancels it.
+    // A relative range's expression, not its moving bounds, identifies a chart query.
     const chartQuery = JSON.stringify([
       fetchUrl, metricKey, timeInterval, timeout, advancedTopN, selection,
       timeRange?.min ?? queryMin, timeRange?.max ?? queryMax
     ])
+    const querySignature = JSON.stringify(queryParams)
 
-    const fetchData = async (queryParams, fetchUrl, metricKey, timeInterval, showLoading) => {
+    const abortTopN = () => {
+      const active = activeTopNRef.current;
+      activeTopNRef.current = undefined; // Also discard its queued refresh.
+      active?.controller.abort();
+    }
+
+    const fetchData = async (params, showLoading) => {
       if (!observerRef.current.isInView || !fetchUrl) return;
-      let controller;
+      const newQueryParams = { ...params, key: metricKey, timeout };
+      if (timeInterval) newQueryParams.bucket_size = timeInterval;
+
       if (advancedTopN) {
-        if (pendingRequestRef.current?.key === chartQuery &&
-            !pendingRequestRef.current.controller.signal.aborted) return;
-        activeRequestRef.current?.abort();
-        controller = new AbortController();
-        activeRequestRef.current = controller;
-        pendingRequestRef.current = { key: chartQuery, controller };
-      }
-      if (firstFetchRef.current || showLoading) {
-        setLoading(true)
-      }
-      const newQueryParams = {
-        ...queryParams,
-        key: metricKey,
-        timeout
-      }
-      if (advancedTopN) newQueryParams.advanced_topn = true
-      if (timeInterval) {
-        newQueryParams.bucket_size = timeInterval
-      }
-      if (advancedTopN) newQueryParams.topn_async = true
-      let timedOut = false
-      const deadline = controller && setTimeout(() => {
-        timedOut = true
-        controller.abort()
-      }, 90000)
-      let res
-      try {
-        do {
-          res = await request(fetchUrl, {
-            method: 'GET',
-            queryParams: newQueryParams,
-            ignoreTimeout: true,
-            ...(controller ? { signal: controller.signal, expirys: false } : {})
-          }, false, false)
-          if (!controller || controller.signal.aborted || !['pending', 'busy'].includes(res?.topn_status)) break
-          setMetric(undefined)
-          setLoading(true)
-          setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }))
-          await new Promise((resolve) => {
-            const finish = () => {
-              clearTimeout(timer)
-              controller.signal.removeEventListener('abort', finish)
-              resolve()
+        const previous = activeTopNRef.current;
+        if (previous?.key === chartQuery) {
+          // Replace rather than append: a burst of ticks/clicks owes only one fetch.
+          previous.next = { params, showLoading };
+          return;
+        }
+        previous?.controller.abort();
+        const controller = new AbortController();
+        const active = { key: chartQuery, controller };
+        activeTopNRef.current = active;
+        newQueryParams.advanced_topn = true;
+        newQueryParams.topn_async = true;
+        setError();
+        if (firstFetchRef.current || showLoading) setLoading(true);
+
+        let res;
+        let pending = false;
+        let deadline;
+        let finishOnAbort;
+        try {
+          const query = async () => {
+            while (!controller.signal.aborted) {
+              const response = await request(fetchUrl, {
+                method: 'GET',
+                queryParams: newQueryParams,
+                ignoreTimeout: true,
+                signal: controller.signal,
+                expirys: false
+              }, false, false);
+              if (controller.signal.aborted || activeTopNRef.current !== active) return;
+              const status = response?.topn_status;
+              if (status === 'pending') pending = true;
+              if (status !== 'pending' && !(pending && status === 'busy')) return response;
+              setLoading(true);
+              setError(formatMessage({ id: `cluster.metrics.topn.${status}` }));
+              // Once admitted, polls use exactly the same absolute window.
+              await new Promise((resolve) => {
+                const finish = () => {
+                  clearTimeout(timer);
+                  controller.signal.removeEventListener('abort', finish);
+                  resolve();
+                };
+                const timer = setTimeout(finish, 2000);
+                controller.signal.addEventListener('abort', finish, { once: true });
+              });
             }
-            const timer = setTimeout(finish, 2000)
-            controller.signal.addEventListener('abort', finish, { once: true })
-          })
-        } while (!controller.signal.aborted)
+          };
+          res = await Promise.race([
+            new Promise((resolve) => {
+              finishOnAbort = () => resolve();
+              controller.signal.addEventListener('abort', finishOnAbort, { once: true });
+              deadline = setTimeout(() => {
+                resolve({ topn_status: 'timed_out' });
+                controller.abort();
+              }, 90000);
+            }),
+            query()
+          ]);
+        } catch {
+          res = undefined;
+        } finally {
+          clearTimeout(deadline);
+          if (finishOnAbort) controller.signal.removeEventListener('abort', finishOnAbort);
+        }
+        if (activeTopNRef.current !== active || !observerRef.current.isInView) return;
+        activeTopNRef.current = undefined;
+        firstFetchRef.current = false;
+        const fail = (status) => {
+          setMetric(undefined);
+          setError(formatMessage({ id: `cluster.metrics.topn.${status}` }));
+        };
+        try {
+          if (res?.topn_status) {
+            fail(res.topn_status);
+          } else if (res?.error || (res?.metrics?.[metricKey] && typeof res.metrics[metricKey] === 'object' && !Array.isArray(res.metrics[metricKey]))) {
+            applyResponse(res);
+          } else {
+            fail('query_failed');
+          }
+        } catch {
+          fail('query_failed');
+        } finally {
+          setLoading(false);
+        }
+        if (active.next) fetchData(active.next.params, active.next.showLoading);
+        return;
+      }
+
+      if (firstFetchRef.current || showLoading) setLoading(true);
+      const legacyContext = observerRef.current.legacyContext;
+      let res;
+      try {
+        res = await request(fetchUrl, {
+          method: 'GET',
+          queryParams: newQueryParams,
+          ignoreTimeout: true
+        }, false, false);
       } catch {
-        res = undefined
-      } finally {
-        clearTimeout(deadline)
-        if (pendingRequestRef.current?.controller === controller) pendingRequestRef.current = undefined;
+        res = undefined;
       }
-      if (controller?.signal.aborted) {
-        if (!timedOut || activeRequestRef.current !== controller || !observerRef.current.isInView) return;
-        res = { topn_status: 'timed_out' }
-      }
-      if (advancedTopN && res?.topn_status) {
-        setMetric(undefined);
-        setError(formatMessage({ id: `cluster.metrics.topn.${res.topn_status}` }));
-      } else if (advancedTopN && !res?.error && (!res?.metrics || typeof res.metrics !== "object" || Array.isArray(res.metrics))) {
-        setMetric(undefined);
-        setError(formatMessage({ id: "cluster.metrics.topn.query_failed" }));
-      } else if (res?.error) {
-        const error = formatResponse(res);
-        setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
-      } else if (res && !res.error) {
-        const metric = res.metrics?.[metricKey];
-        setError()
-        setMetric(formatMetric && metric ? formatMetric(metric) : metric);
-      }
-      if (advancedTopN || firstFetchRef.current || showLoading) {
-        setLoading(false)
-        firstFetchRef.current = false
+      // Legacy requests stay uncancelled, but must not write across a mode change.
+      if (observerRef.current.legacyContext !== legacyContext) return;
+      applyResponse(res);
+      if (firstFetchRef.current || showLoading) {
+        setLoading(false);
+        firstFetchRef.current = false;
       }
     }
 
-    useEffect(() => { fetchDataRef.current = fetchData; });
+    const applyResponse = (res) => {
+      if (res?.error) {
+        const error = formatResponse(res);
+        setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason);
+      } else if (res) {
+        const metric = res.metrics?.[metricKey];
+        setError();
+        setMetric(formatMetric && metric ? formatMetric(metric) : metric);
+      }
+    }
+
+    useLayoutEffect(() => {
+      observerRef.current.query = chartQuery;
+      observerRef.current.advancedTopN = advancedTopN;
+    }, [chartQuery, advancedTopN]);
+
+    useLayoutEffect(() => {
+      const observer = observerRef.current;
+      observer.legacyContext = {};
+      setMetric(undefined);
+      setError();
+      setLoading(false);
+      firstFetchRef.current = true;
+      return () => { observer.legacyContext = undefined; };
+    }, [advancedTopN]);
+
+    // Invalidate before I/O can report a result for an older committed query.
+    useLayoutEffect(() => {
+      if (advancedTopN) setMetric(undefined);
+      return abortTopN;
+    }, [chartQuery]);
 
     const fixFormat = (formatType, format) => {
       return formatType === 'num' && format ? `${format}a` : format
     }
-  
-    useEffect(() => {
-      observerRef.current.deps = cloneDeep([queryParams, fetchUrl, metricKey, timeInterval, refresh])
-      if (advancedTopN && observerRef.current.isInView) {
-        observerRef.current.lastDeps = cloneDeep(observerRef.current.deps);
-      }
-      fetchData(queryParams, fetchUrl, metricKey, timeInterval, refresh)
-    }, [JSON.stringify(queryParams), chartQuery, refresh])
 
-    useEffect(() => () => activeRequestRef.current?.abort(), [chartQuery]);
-  
+    const currentParams = (params) => advancedTopN && timeRange?.min != null && timeRange?.max != null
+      ? { ...params, ...formatTimeRange(timeRange) }
+      : params;
+
     useEffect(() => {
+      const observer = observerRef.current;
+      const args = [cloneDeep(queryParams), refresh];
+      const deps = { key: chartQuery, start: () => fetchData(currentParams(args[0]), args[1]) };
+      observer.deps = deps;
+      if (observer.isInView) {
+        observer.lastDeps = deps;
+        fetchData(...args);
+      }
+    }, [querySignature, chartQuery, refresh]);
+
+    useEffect(() => {
+      const state = observerRef.current;
       const observer = new IntersectionObserver(
         entries => {
           entries.forEach(entry => {
             if (entry.isIntersecting) {
-              observerRef.current.isInView = true
-              if (JSON.stringify(observerRef.current.deps) !== JSON.stringify(observerRef.current.lastDeps)) {
-                observerRef.current.lastDeps = cloneDeep(observerRef.current.deps)
-                fetchDataRef.current?.(...observerRef.current.deps)
+              state.isInView = true;
+              const { deps } = state;
+              if (deps && deps.key === state.query && deps !== state.lastDeps) {
+                state.lastDeps = deps;
+                deps.start();
               }
             } else {
-              observerRef.current.isInView = false
-              if (advancedTopN) {
-                activeRequestRef.current?.abort();
-                observerRef.current.lastDeps = undefined;
+              state.isInView = false;
+              if (state.advancedTopN) {
+                abortTopN();
+                state.lastDeps = undefined;
+                setLoading(false);
               }
             }
           });
@@ -193,17 +267,11 @@ export default (props) => {
           threshold: 0,
         }
       );
-   
-      if (containerRef.current) {
-        observer.observe(containerRef.current);
-      }
-   
-      return () => {
-        if (containerRef.current) {
-          observer.unobserve(containerRef.current);
-        }
-      };
-    }, [isInView]);
+      if (containerRef.current) observer.observe(containerRef.current);
+      return () => observer.disconnect();
+    }, []);
+
+    const handleRefresh = () => fetchData(cloneDeep(currentParams(queryParams)), true);
   
     const handleChartBrush = ({ x }) => {
       if (!x) {
@@ -223,7 +291,7 @@ export default (props) => {
     };
 
     const renderChart = () => {
-      if (error) {
+      if (error && (!advancedTopN || !loading || !metric)) {
         return (
           <div style={{ height, padding: 10 }}>
             <Alert style={{ maxHeight: '100%', overflow: 'auto', wordBreak: 'break-all'}} message={error} type={loading ? "info" : "error"}/>
@@ -393,22 +461,7 @@ export default (props) => {
       }
     }
   
-    return (
-      <div key={metricKey} ref={containerRef} className={className} style={style}>
-        {
-                metric?.request && (
-                  <CopyToClipboard text={`GET .infini_metrics/_search\n${metric.request}`}>
-                    <Tooltip title={formatMessage({id: "cluster.metrics.request.copy"})}>
-                      <Icon 
-                        className="copyReq"
-                        type="copy" 
-                        onClick={() => message.success(formatMessage({id: "cluster.metrics.request.copy.success"}))}
-                      />
-                    </Tooltip>
-                  </CopyToClipboard>
-                )
-              }
-        <Spin spinning={loading}>
+    const heading = (
         <div className={styles.vizChartItemTitle}>
           <span>
             {chartTitle.title}
@@ -424,12 +477,30 @@ export default (props) => {
                 )
               }
               <Tooltip title={formatMessage({id: "form.button.refresh"})}>
-                <Icon className={styles.copy} type="sync" onClick={() => fetchData(...observerRef.current.deps, true)}/>
+                <Icon className={styles.copy} type="sync" onClick={handleRefresh}/>
               </Tooltip>
             </span>
           }
         </div>
-        {renderChart()}
+    );
+
+    return (
+      <div key={metricKey} ref={containerRef} className={className} style={style}>
+        {metric?.request && (
+          <CopyToClipboard text={`GET .infini_metrics/_search\n${metric.request}`}>
+            <Tooltip title={formatMessage({id: "cluster.metrics.request.copy"})}>
+              <Icon
+                className="copyReq"
+                type="copy"
+                onClick={() => message.success(formatMessage({id: "cluster.metrics.request.copy.success"}))}
+              />
+            </Tooltip>
+          </CopyToClipboard>
+        )}
+        {advancedTopN && heading}
+        <Spin spinning={loading}>
+          {!advancedTopN && heading}
+          {renderChart()}
         </Spin>
       </div>
     );
