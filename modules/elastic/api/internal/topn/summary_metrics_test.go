@@ -12,12 +12,14 @@ import (
 func TestSharedTopNFieldsAndScores(t *testing.T) {
 	q := Query{Source: "index_stats", Cluster: "biz", AllIndices: true, Width: 1, Min: 2000, Max: 3999, N: 5}
 	type series struct {
-		counter [][2]int // (write, query) counter per bucket
-		time    [][2]int // (write, query) time per bucket
+		counter       [][2]int // (write, query) counter per bucket
+		pairedCounter [][2]int // operation counts from paired latency observations
+		time          [][2]int // (write, query) time per bucket
 	}
 	rows := series{
-		counter: [][2]int{{10, 100}, {99, 105}, {99, 106}},
-		time:    [][2]int{{200, 500}, {210, 530}, {210, 531}},
+		counter:       [][2]int{{10, 100}, {99, 105}, {99, 106}},
+		pairedCounter: [][2]int{{10, 100}, {12, 105}, {12, 106}},
+		time:          [][2]int{{200, 500}, {210, 530}, {210, 531}},
 	}
 	s := snapshot{id: "ok", shards: 1, call: func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
 		aggs := body["aggs"].(dsl)["entities"].(dsl)["aggs"].(dsl)["dates"].(dsl)["aggs"].(dsl)
@@ -37,9 +39,9 @@ func TestSharedTopNFieldsAndScores(t *testing.T) {
 			fields := aggs["pair"].(dsl)["top_hits"].(dsl)["docvalue_fields"].([]string)
 			firstTime := fields[0] == writeTimeField
 			for i, ts := range []int{1000, 2000, 3000} {
-				counter, when := rows.counter[i][0], rows.time[i][0]
+				counter, when := rows.pairedCounter[i][0], rows.time[i][0]
 				if !firstTime {
-					counter, when = rows.counter[i][1], rows.time[i][1]
+					counter, when = rows.pairedCounter[i][1], rows.time[i][1]
 				}
 				points = append(points, dsl{"key": ts, "doc_count": 1,
 					"pair":     latencyHit(dsl{fields[0]: []int{when}, fields[1]: []int{counter}}),

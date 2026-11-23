@@ -8,13 +8,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"infini.sh/framework/core/elastic"
 	"infini.sh/framework/modules/elastic/common"
 )
 
-const allShards = `"_shards":{"total":3,"successful":3,"failed":0}`
+const (
+	allShards            = `"_shards":{"total":3,"successful":3,"failed":0}`
+	rawIndexUUIDResponse = `{"raw":{"settings":{"index.uuid":"uuid"}}}`
+	pitCloseResponse     = `{"pits":[{"pit_id":"p","successful":true}]}`
+)
 
 func result(entities string) []byte {
 	return []byte(fmt.Sprintf(`{%s,"timed_out":false,"aggregations":{"entities":%s}}`, allShards, entities))
@@ -26,7 +31,7 @@ func TestPeakSnapshot(t *testing.T) {
 		calls++
 		switch calls {
 		case 1:
-			if method != "POST" || path[:len("/raw/_pit?")] != "/raw/_pit?" {
+			if method != "POST" || !strings.HasPrefix(path, "/raw/_pit?") {
 				t.Fatalf("open %s %s", method, path)
 			}
 			return []byte(`{"pit_id":"fixed",` + allShards + `}`), nil
@@ -65,10 +70,10 @@ func TestPeakSnapshot(t *testing.T) {
 	}
 	s.close()
 	if calls != 4 || len(m.Item.Lines) != 2 || m.Item.Lines[0].Metric.Label != "inactive" || m.Item.Lines[1].Metric.Label != "active" {
-		t.Fatal(m.Item.Lines)
+		t.Fatalf("calls=%d lines=%v, want 4 calls and inactive, active lines", calls, m.Item.Lines)
 	}
 	if got := m.Item.Lines[0].Data; !reflect.DeepEqual(got, [][]interface{}{{int64(1000), 80.0}, {int64(2000), 90.0}}) {
-		t.Fatal(got)
+		t.Fatalf("inactive data=%v, want [[1000 80] [2000 90]]", got)
 	}
 }
 
@@ -124,15 +129,20 @@ func TestFailureStatus(t *testing.T) {
 	}
 }
 
-func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
+func saturateSearchSlots(t *testing.T) {
+	t.Helper()
 	for i := 0; i < cap(slots); i++ {
 		slots <- struct{}{}
 	}
-	defer func() {
+	t.Cleanup(func() {
 		for i := 0; i < cap(slots); i++ {
 			<-slots
 		}
-	}()
+	})
+}
+
+func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
+	saturateSearchSlots(t)
 	var cfg config
 	cfg.TopN.RawIndex = "raw"
 	store := func() (caller, elastic.Version, string) {

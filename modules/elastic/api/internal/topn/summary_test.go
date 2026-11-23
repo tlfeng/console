@@ -68,9 +68,9 @@ func TestSummaryFailedSearchDoesNotPublish(t *testing.T) {
 		switch {
 		case method == http.MethodDelete:
 			closes++
-			return []byte(`{"pits":[{"pit_id":"p","successful":true}]}`), nil
+			return []byte(pitCloseResponse), nil
 		case method == http.MethodGet:
-			return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
+			return []byte(rawIndexUUIDResponse), nil
 		case method == http.MethodPut:
 			writes++
 			return nil, nil

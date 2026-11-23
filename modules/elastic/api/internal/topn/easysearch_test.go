@@ -43,19 +43,16 @@ func publishTransitions(ctx context.Context, call caller, api pitAPI, m summaryS
 	return publishProvenBuckets(ctx, call, api, m, q, set, metric.Item.Key, proof)
 }
 
-// Use a disposable loopback Easysearch cluster. Never point this at a real monitoring store.
-func TestEasysearchSnapshot(t *testing.T) {
-	if os.Getenv("CONSOLE_TOPN_INTEGRATION") != "1" {
-		t.Skip("set CONSOLE_TOPN_INTEGRATION=1 for a disposable Easysearch on localhost:19219")
-	}
-	const epoch = 1780000000000
-	const base = "http://127.0.0.1:19219"
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	call := func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
+// integrationCaller is used only with the fixed loopback test endpoints below.
+func integrationCaller(base string) caller {
+	return func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
 		var b []byte
 		if body != nil {
-			b, _ = json.Marshal(body)
+			var err error
+			b, err = json.Marshal(body)
+			if err != nil {
+				return nil, err
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(b))
 		if err != nil {
@@ -76,6 +73,30 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 		return raw, nil
 	}
+}
+
+func mustIntegrationCall(t *testing.T, ctx context.Context, call caller) func(string, string, dsl) []byte {
+	t.Helper()
+	return func(method, path string, body dsl) []byte {
+		t.Helper()
+		raw, err := call(ctx, method, path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+}
+
+// Use a disposable loopback Easysearch cluster. Never point this at a real monitoring store.
+func TestEasysearchSnapshot(t *testing.T) {
+	if os.Getenv("CONSOLE_TOPN_INTEGRATION") != "1" {
+		t.Skip("set CONSOLE_TOPN_INTEGRATION=1 for a disposable Easysearch on localhost:19219")
+	}
+	const epoch = 1780000000000
+	const base = "http://127.0.0.1:19219"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	call := integrationCaller(base)
 	raw, err := call(ctx, "GET", "/", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -87,12 +108,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		t.Fatal("not the disposable TopN test cluster")
 	}
 	index := fmt.Sprintf("console-topn-test-%d", time.Now().UnixNano())
-	must := func(method, path string, body dsl) {
-		t.Helper()
-		if _, err := call(ctx, method, path, body); err != nil {
-			t.Fatal(err)
-		}
-	}
+	must := mustIntegrationCall(t, ctx, call)
 	must("PUT", "/"+index, dsl{"settings": dsl{"number_of_shards": 3, "number_of_replicas": 0}, "mappings": dsl{"properties": dsl{
 		"timestamp": dsl{"type": "date"}, "metric": dsl{"type": "long"}, "metadata": dsl{"properties": dsl{
 			"name": dsl{"type": "keyword"}, "category": dsl{"type": "keyword"}, "labels": dsl{"properties": dsl{"cluster_id": dsl{"type": "keyword"}, "index_name": dsl{"type": "keyword"}, "index_uuid": dsl{"type": "keyword"}, "transport_address": dsl{"type": "keyword"}, "node_id": dsl{"type": "keyword"}}},
@@ -648,38 +664,8 @@ func TestElasticsearch68SingleSearch(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	call := func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
-		var b []byte
-		if body != nil {
-			b, _ = json.Marshal(body)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, "http://127.0.0.1:19220"+path, bytes.NewReader(b))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer res.Body.Close()
-		raw, err := io.ReadAll(res.Body)
-		if err != nil {
-			return nil, err
-		}
-		if res.StatusCode >= 300 {
-			return nil, fmt.Errorf("%s %s: %s", method, path, raw)
-		}
-		return raw, nil
-	}
-	must := func(method, path string, body dsl) []byte {
-		t.Helper()
-		raw, err := call(ctx, method, path, body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return raw
-	}
+	call := integrationCaller("http://127.0.0.1:19220")
+	must := mustIntegrationCall(t, ctx, call)
 	var info struct {
 		Cluster string `json:"cluster_name"`
 		Version struct {

@@ -78,14 +78,7 @@ func TestOnDemandQueue(t *testing.T) {
 }
 
 func TestRetainedJobSlotSaturation(t *testing.T) {
-	for i := 0; i < cap(slots); i++ {
-		slots <- struct{}{}
-	}
-	defer func() {
-		for i := 0; i < cap(slots); i++ {
-			<-slots
-		}
-	}()
+	saturateSearchSlots(t)
 	const key = "retained-slot-test"
 	m := summaryMetric(writeRateKey)
 	saved := summaryMetric(writeRateKey)
@@ -135,11 +128,11 @@ func TestReadOnDemandWithoutWriteAllowance(t *testing.T) {
 			call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
 				switch {
 				case method == http.MethodGet && strings.HasPrefix(path, "/raw/_settings/index.uuid?"):
-					return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
+					return []byte(rawIndexUUIDResponse), nil
 				case method == http.MethodPost && (strings.HasPrefix(path, "/raw/_pit?") || strings.HasPrefix(path, "/"+m.index+"/_pit?")):
 					return []byte(`{"pit_id":"p",` + shard + `}`), nil
 				case method == http.MethodDelete && path == "/_pit":
-					return []byte(`{"pits":[{"pit_id":"p","successful":true}]}`), nil
+					return []byte(pitCloseResponse), nil
 				case method == http.MethodPost && strings.HasPrefix(path, "/_search?"):
 					if query := body["query"].(dsl); query["ids"] != nil {
 						summaryReads++
@@ -203,11 +196,11 @@ func TestMissingSummaryTargetOnlyAllowedWithoutPublishing(t *testing.T) {
 			call := func(_ context.Context, method, path string, _ dsl) ([]byte, error) {
 				switch {
 				case method == http.MethodGet && strings.HasPrefix(path, "/raw/_settings/index.uuid?"):
-					return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
+					return []byte(rawIndexUUIDResponse), nil
 				case method == http.MethodPost && strings.HasPrefix(path, "/raw/_pit?"):
 					return []byte(`{"pit_id":"p",` + allShards + `}`), nil
 				case method == http.MethodDelete && path == "/_pit":
-					return []byte(`{"pits":[{"pit_id":"p","successful":true}]}`), nil
+					return []byte(pitCloseResponse), nil
 				case method == http.MethodPost && strings.HasPrefix(path, "/"+m.index+"/_pit?"):
 					return nil, tc.status
 				case method == http.MethodPost && strings.HasPrefix(path, "/_search?"):
@@ -255,13 +248,13 @@ func TestOnDemandEmptyDoesNotPublish(t *testing.T) {
 	calls := 0
 	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
 		if method == http.MethodGet {
-			return []byte(`{"raw":{"settings":{"index.uuid":"uuid"}}}`), nil
+			return []byte(rawIndexUUIDResponse), nil
 		}
 		if method == http.MethodPut {
 			t.Fatal("empty bucket must not be persisted")
 		}
 		if method == http.MethodDelete {
-			return []byte(`{"pits":[{"pit_id":"p","successful":true}]}`), nil
+			return []byte(pitCloseResponse), nil
 		}
 		if body == nil {
 			return []byte(`{"pit_id":"p","_shards":{"total":1,"successful":1,"failed":0}}`), nil

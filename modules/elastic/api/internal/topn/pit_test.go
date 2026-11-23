@@ -77,7 +77,7 @@ func TestQueryRouting(t *testing.T) {
 		{"node PIT", "node_stats", true, false, []string{"open", "search", "close"}},
 		{"node incomplete PIT", "node_stats", true, true, []string{"open", "close", "single"}},
 		{"index PIT", "index_stats", true, false, []string{"open", "search", "close"}},
-		{"index incomplete PIT", "index_stats", true, false, []string{"open", "close", "single"}},
+		{"index incomplete PIT", "index_stats", true, true, []string{"open", "close", "single"}},
 		{"index without PIT", "index_stats", false, false, []string{"single"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
