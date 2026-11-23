@@ -68,7 +68,9 @@ func validCounter(v float64) bool {
 	return v >= 0 && !math.IsInf(v, 0)
 }
 
-func counterPoint(previous, current samples, width int64, metric Metric, node bool) (float64, bool, error) {
+// Index transitions also carry shard and replica evidence; node transitions
+// never do, so their topology guard is always vacuous.
+func counterPoint(previous, current samples, width int64, metric Metric) (float64, bool, error) {
 	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width {
 		return 0, false, nil
 	}
@@ -76,7 +78,7 @@ func counterPoint(previous, current samples, width int64, metric Metric, node bo
 	if id == "" || id != current.entity() {
 		return 0, false, nil
 	}
-	if !node && (changed(previous.Shards, current.Shards) || changed(previous.Replicas, current.Replicas)) {
+	if changed(previous.Shards, current.Shards) || changed(previous.Replicas, current.Replicas) {
 		return 0, false, nil
 	}
 

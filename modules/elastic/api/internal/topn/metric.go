@@ -71,7 +71,8 @@ func metricBucketCost(q Query, metric Metric) int {
 	w := int64(q.Width) * 1000
 	n := int(q.Max/w-q.Min/w) + 1
 	if metric.mode.difference() {
-		// Date bucket plus up to two identity buckets.
+		// A date bucket plus up to two identity buckets. Index sources add shard
+		// and replica maxima, so this is a lower bound for them.
 		return 3 * (n + 1)
 	}
 	return n
@@ -116,7 +117,7 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 			}
 		default:
 			var err error
-			v, valid, err = counterPoint(previous, p, width, metric, q.Source == "node_stats")
+			v, valid, err = counterPoint(previous, p, width, metric)
 			if err != nil {
 				return winner{}, err
 			}

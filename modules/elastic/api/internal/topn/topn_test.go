@@ -107,6 +107,9 @@ func TestFailureStatus(t *testing.T) {
 	}{
 		{errSummaryPending, "pending"},
 		{fmt.Errorf("search: %w", errSummaryBusy), "busy"},
+		{fmt.Errorf("search: %w", errSummaryPolicyChanged), "summary_policy_changed"},
+		{errSummaryHistory, "summary_unavailable"},
+		{fmt.Errorf("open summary: %w", errSummaryTargetMissing), "summary_unavailable"},
 		{errRawHistory, "history_unavailable"},
 		{fmt.Errorf("search: %w", errBudget), "budget_exceeded"},
 		{context.DeadlineExceeded, "timed_out"},

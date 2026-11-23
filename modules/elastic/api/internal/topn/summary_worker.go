@@ -80,7 +80,7 @@ func readTransitionBatches(ctx context.Context, s *snapshot, q Query, batches []
 			projection := projections[j]
 			for i, ts := range batch.starts {
 				a, b := byTime[ts-w].project(batch.metric, projection), byTime[ts].project(batch.metric, projection)
-				v, ok, err := counterPoint(a, b, w, batch.metric, false)
+				v, ok, err := counterPoint(a, b, w, batch.metric)
 				if err != nil {
 					return err
 				}

@@ -280,7 +280,6 @@ func TestEasysearchSnapshot(t *testing.T) {
 			doc := dsl{
 				"timestamp": epoch + row.offset, "metric": row.count, "ops": row.count, "elapsed": row.count * 3,
 				"metadata": dsl{"name": "node_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "decoy", "transport_address": "n1", "node_id": "same-node"}},
-				"payload":  dsl{"elasticsearch": dsl{"node_stats": dsl{"jvm": dsl{"timestamp": epoch + row.offset, "uptime_in_millis": row.offset}}}},
 			}
 			must("PUT", fmt.Sprintf("/%s/_doc/decoy-%d?refresh=true", index, i), doc)
 			if row.offset == 79000 {
