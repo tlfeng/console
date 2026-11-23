@@ -80,7 +80,8 @@ func TestSummaryFailedSearchDoesNotPublish(t *testing.T) {
 			return nil, errors.New("search failed")
 		}
 	}
-	if err := publishTransitionBatches(ctx, call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, []transitionBatch{{summaryMetric(writeRateKey), []int64{2000}}}); err == nil || writes != 0 || closes != 1 {
+	err := computeMissingSummaries(ctx, call, pitAPI{path: "/_pit", idField: "pit_id"}, m, q, summaryMetric(writeRateKey), time.Unix(3000, 0), true)
+	if err == nil || writes != 0 || closes != 1 {
 		t.Fatalf("err=%v writes=%d closes=%d", err, writes, closes)
 	}
 }

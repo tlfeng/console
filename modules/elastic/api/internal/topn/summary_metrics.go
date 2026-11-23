@@ -30,10 +30,7 @@ var summaryMetrics = map[string]summaryMetricDefinition{
 
 func (c summaryConfig) metricKeys() []string {
 	if len(c.Metrics) == 0 {
-		if c.Enabled {
-			return []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey}
-		}
-		return []string{writeRateKey}
+		return []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey}
 	}
 	return c.Metrics
 }
@@ -62,59 +59,4 @@ func (c summaryConfig) validateMetrics() error {
 func summaryMetric(key string) Metric {
 	def := summaryMetrics[key]
 	return Metric{Item: &common.MetricItem{Key: key}, Field: def.field, Field2: def.other, mode: def.mode}
-}
-
-type transitionBatch struct {
-	metric Metric
-	starts []int64
-}
-
-// Rates need one maximum; latency needs two counters from one document.
-// Share the scan and its identity/topology evidence across all requested metrics.
-func transitionAggs(q Query, batches []transitionBatch) (dsl, []int, error) {
-	aggs := counterEvidence(q)
-	rateSlots := [...]string{"value", "other"}
-	pairSlots := [...]string{"pair", "second_pair"}
-	rates := make(map[string]int, len(rateSlots))
-	pairs := make(map[[2]string]int, len(pairSlots))
-	projections := make([]int, len(batches))
-	for i, batch := range batches {
-		metric := batch.metric
-		if metric.mode == latency {
-			key := [2]string{metric.Field, metric.Field2}
-			slot, ok := pairs[key]
-			if !ok {
-				slot = len(pairs)
-				if slot == len(pairSlots) {
-					return nil, nil, fmt.Errorf("too many shared TopN latency pairs")
-				}
-				pairs[key] = slot
-				aggs[pairSlots[slot]] = latencyPair(metric)
-			}
-			projections[i] = slot
-			continue
-		}
-		slot, ok := rates[metric.Field]
-		if !ok {
-			slot = len(rates)
-			if slot == len(rateSlots) {
-				return nil, nil, fmt.Errorf("too many shared TopN rate counters")
-			}
-			rates[metric.Field] = slot
-			aggs[rateSlots[slot]] = maximum(metric.Field)
-		}
-		projections[i] = slot
-	}
-	return aggs, projections, nil
-}
-
-func (s samples) project(metric Metric, slot int) samples {
-	if slot == 1 {
-		if metric.mode == latency {
-			s.Pair = s.SecondPair
-		} else {
-			s.Value = s.Other
-		}
-	}
-	return s
 }

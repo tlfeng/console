@@ -70,7 +70,7 @@ export default (props) => {
 
     const abortTopN = () => {
       const active = activeTopNRef.current;
-      activeTopNRef.current = undefined; // Also discard its queued refresh.
+      activeTopNRef.current = undefined;
       active?.controller.abort();
     }
 
@@ -80,91 +80,42 @@ export default (props) => {
       if (timeInterval) newQueryParams.bucket_size = timeInterval;
 
       if (advancedTopN) {
-        const previous = activeTopNRef.current;
-        if (previous?.key === chartQuery) {
-          // Replace rather than append: a burst of ticks/clicks owes only one fetch.
-          previous.next = { params, showLoading };
-          return;
-        }
-        previous?.controller.abort();
+        // The server waits for on-demand work and answers once with a final
+        // status, so one request is one outcome; a newer query aborts this one.
+        activeTopNRef.current?.controller.abort();
         const controller = new AbortController();
-        const active = { key: chartQuery, controller };
-        activeTopNRef.current = active;
+        activeTopNRef.current = { key: chartQuery, controller };
         newQueryParams.advanced_topn = true;
-        newQueryParams.topn_async = true;
         setError();
         if (firstFetchRef.current || showLoading) setLoading(true);
 
         let res;
-        let pending = false;
-        let deadline;
-        let finishOnAbort;
         try {
-          const query = async () => {
-            while (!controller.signal.aborted) {
-              const response = await request(fetchUrl, {
-                method: 'GET',
-                queryParams: newQueryParams,
-                ignoreTimeout: true,
-                signal: controller.signal,
-                expirys: false
-              }, false, false);
-              if (controller.signal.aborted || activeTopNRef.current !== active) return;
-              const status = response?.topn_status;
-              if (status === 'pending') pending = true;
-              if (status !== 'pending' && !(pending && status === 'busy')) return response;
-              setLoading(true);
-              setError(formatMessage({ id: `cluster.metrics.topn.${status}` }));
-              // Once admitted, polls use exactly the same absolute window.
-              await new Promise((resolve) => {
-                const finish = () => {
-                  clearTimeout(timer);
-                  controller.signal.removeEventListener('abort', finish);
-                  resolve();
-                };
-                const timer = setTimeout(finish, 2000);
-                controller.signal.addEventListener('abort', finish, { once: true });
-              });
-            }
-          };
-          res = await Promise.race([
-            new Promise((resolve) => {
-              finishOnAbort = () => resolve();
-              controller.signal.addEventListener('abort', finishOnAbort, { once: true });
-              deadline = setTimeout(() => {
-                resolve({ topn_status: 'timed_out' });
-                controller.abort();
-              }, 90000);
-            }),
-            query()
-          ]);
+          res = await request(fetchUrl, {
+            method: 'GET',
+            queryParams: newQueryParams,
+            ignoreTimeout: true,
+            signal: controller.signal,
+            expirys: false
+          }, false, false);
         } catch {
           res = undefined;
-        } finally {
-          clearTimeout(deadline);
-          if (finishOnAbort) controller.signal.removeEventListener('abort', finishOnAbort);
         }
-        if (activeTopNRef.current !== active || !observerRef.current.isInView) return;
+        if (activeTopNRef.current?.controller !== controller || !observerRef.current.isInView) return;
         activeTopNRef.current = undefined;
         firstFetchRef.current = false;
         const fail = (status) => {
           setMetric(undefined);
           setError(formatMessage({ id: `cluster.metrics.topn.${status}` }));
         };
-        try {
-          if (res?.topn_status) {
-            fail(res.topn_status);
-          } else if (res?.error || (res?.metrics?.[metricKey] && typeof res.metrics[metricKey] === 'object' && !Array.isArray(res.metrics[metricKey]))) {
-            applyResponse(res);
-          } else {
-            fail('query_failed');
-          }
-        } catch {
+        if (res?.topn_status) {
+          fail(res.topn_status);
+        } else if (res?.error || (res?.metrics?.[metricKey] && typeof res.metrics[metricKey] === 'object' && !Array.isArray(res.metrics[metricKey]))) {
+          applyResponse(res);
+        } else {
           fail('query_failed');
-        } finally {
-          setLoading(false);
         }
-        if (active.next) fetchData(active.next.params, active.next.showLoading);
+        setLoading(false);
         return;
       }
 

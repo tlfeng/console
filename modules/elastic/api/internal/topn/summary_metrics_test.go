@@ -10,57 +10,73 @@ import (
 )
 
 func TestSharedTopNFieldsAndScores(t *testing.T) {
-	keys := []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey}
 	q := Query{Source: "index_stats", Cluster: "biz", AllIndices: true, Width: 1, Min: 2000, Max: 3999, N: 5}
-	var batches []transitionBatch
-	for _, key := range keys {
-		m := summaryMetric(key)
-		route := q
-		route.Width = 10800
-		route.Max = route.Min + 15*86400000
-		if !useSummary(route, m) {
-			t.Fatalf("missing route for %s", key)
-		}
-		m.Field += ".wrong"
-		if useSummary(route, m) {
-			t.Fatalf("wrong source field accepted for %s", key)
-		}
-		batches = append(batches, transitionBatch{summaryMetric(key), []int64{2000, 3000}})
+	type series struct {
+		counter [][2]int // (write, query) counter per bucket
+		time    [][2]int // (write, query) time per bucket
 	}
-	calls := 0
+	rows := series{
+		counter: [][2]int{{10, 100}, {99, 105}, {99, 106}},
+		time:    [][2]int{{200, 500}, {210, 530}, {210, 531}},
+	}
 	s := snapshot{id: "ok", shards: 1, call: func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
-		calls++
 		aggs := body["aggs"].(dsl)["entities"].(dsl)["aggs"].(dsl)["dates"].(dsl)["aggs"].(dsl)
-		if len(aggs) != 7 {
-			t.Fatalf("want two maxima, two paired hits and three evidence aggregations, got %v", aggs)
-		}
-		for name, want := range map[string]dsl{
-			"value": maximum(writeCounterField), "other": maximum(queryCounterField),
-			"pair": latencyPair(summaryMetric(writeLatencyKey)), "second_pair": latencyPair(summaryMetric(queryLatencyKey)),
-		} {
-			if !reflect.DeepEqual(aggs[name], want) {
-				t.Fatalf("wrong %s: %v", name, aggs[name])
-			}
-		}
 		var points []dsl
-		for i, counters := range [][6]int{{10, 100, 10, 200, 100, 500}, {99, 105, 12, 210, 105, 530}, {99, 106, 12, 210, 106, 531}} {
-			p := dsl{"key": (i + 1) * 1000, "doc_count": 1, "identity": dsl{"buckets": []dsl{{"key": "id", "doc_count": 1}}},
-				"value": dsl{"value": counters[0]}, "other": dsl{"value": counters[1]},
-				"pair":        latencyHit(dsl{writeCounterField: []int{counters[2]}, writeTimeField: []int{counters[3]}}),
-				"second_pair": latencyHit(dsl{queryCounterField: []int{counters[4]}, queryTimeField: []int{counters[5]}}),
+		if value, ok := aggs["value"]; ok {
+			field := value.(dsl)["max"].(dsl)["field"].(string)
+			column := 0
+			if field == queryCounterField {
+				column = 1
 			}
-			points = append(points, p)
+			for i, ts := range []int{1000, 2000, 3000} {
+				points = append(points, dsl{"key": ts, "doc_count": 1,
+					"value":    dsl{"value": rows.counter[i][column]},
+					"identity": dsl{"buckets": []dsl{{"key": "id", "doc_count": 1}}}})
+			}
+		} else {
+			fields := aggs["pair"].(dsl)["top_hits"].(dsl)["docvalue_fields"].([]string)
+			firstTime := fields[0] == writeTimeField
+			for i, ts := range []int{1000, 2000, 3000} {
+				counter, when := rows.counter[i][0], rows.time[i][0]
+				if !firstTime {
+					counter, when = rows.counter[i][1], rows.time[i][1]
+				}
+				points = append(points, dsl{"key": ts, "doc_count": 1,
+					"pair":     latencyHit(dsl{fields[0]: []int{when}, fields[1]: []int{counter}}),
+					"identity": dsl{"buckets": []dsl{{"key": "id", "doc_count": 1}}}})
+			}
 		}
 		return json.Marshal(dsl{"timed_out": false, "_shards": dsl{"total": 1, "successful": 1, "failed": 0}, "aggregations": dsl{"entities": dsl{"buckets": []dsl{{"key": dsl{"entity": "x"}, "dates": dsl{"buckets": points}}}}}})
 	}}
-	got, err := readTransitionBatches(context.Background(), &s, q, batches)
-	if err != nil || calls != 1 {
-		t.Fatalf("err=%v searches=%d", err, calls)
-	}
-	for i, want := range [][][]float64{{{89}, {0}}, {{5}, {1}}, {{5}, {}}, {{6}, {1}}} {
-		for j, w := range want {
-			if !reflect.DeepEqual(got[i][j].Scores, w) {
-				t.Fatalf("%s at %d got %v want %v", keys[i], j, got[i][j].Scores, w)
+	for _, tc := range []struct {
+		key  string
+		want [][]float64
+	}{
+		{writeRateKey, [][]float64{{89}, {0}}},
+		{queryRateKey, [][]float64{{5}, {1}}},
+		{writeLatencyKey, [][]float64{{5}, {}}},
+		{queryLatencyKey, [][]float64{{6}, {1}}},
+	} {
+		metric := summaryMetric(tc.key)
+		q.Width = 10800
+		q.Max = q.Min + 15*86400000
+		if !useSummary(q, metric) {
+			t.Fatalf("missing route for %s", tc.key)
+		}
+		metric.Field += ".wrong"
+		if useSummary(q, metric) {
+			t.Fatalf("wrong source field accepted for %s", tc.key)
+		}
+		metric = summaryMetric(tc.key)
+		q.Width = 1
+		q.Max = 3999
+		got, err := readTransitions(context.Background(), &s, q, metric, []int64{2000, 3000})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.key, err)
+		}
+		for j, w := range tc.want {
+			if !reflect.DeepEqual(got[j].Scores, w) {
+				t.Fatalf("%s at %d got %v want %v", tc.key, j, got[j].Scores, w)
 			}
 		}
 	}
@@ -81,28 +97,30 @@ func TestTopNSummaryMetricCoverage(t *testing.T) {
 			t.Fatalf("only latency IDs should change: %s", key)
 		}
 	}
-	q.Width = 1
-	proof := rawBucketProof{1000: {"i": 1}, 2000: {"i": 1}}
-	digest := proof.transition(2000, 1000)
-	writeID = m.provenID(q, writeRateKey, 2000, digest)
-	queryID := m.provenID(q, queryRateKey, 2000, digest)
-	missing, err := missingSummaries(context.Background(), func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
-		if !reflect.DeepEqual(body["query"], dsl{"ids": dsl{"values": []string{writeID, queryID}}}) {
-			t.Fatalf("wrong ids: %v", body)
+	// Omitted metrics cover all four charts; omitted clusters cover every cluster.
+	c := summaryConfig{Enabled: true}
+	for _, key := range []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey} {
+		if !c.enabled("biz", key) || !c.writes() {
+			t.Fatalf("default config must cover and write %s", key)
 		}
-		return []byte(fmt.Sprintf(`{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":%q}]}}`, writeID)), nil
-	}, m, q, []string{writeRateKey, queryRateKey}, []int64{2000}, proof)
-	if err != nil || !reflect.DeepEqual(missing, map[string][]int64{queryRateKey: {2000}}) {
-		t.Fatalf("%v %v", missing, err)
+	}
+	if !reflect.DeepEqual(c.metricKeys(), []string{writeRateKey, queryRateKey, writeLatencyKey, queryLatencyKey}) {
+		t.Fatalf("unexpected default metric keys: %v", c.metricKeys())
+	}
+	c.Clusters = []string{"other"}
+	if c.enabled("biz", writeRateKey) {
+		t.Fatal("cluster allowlist must exclude other clusters")
+	}
+	// Metrics selects the write set; ReadMetrics can narrow the read set below it.
+	c = summaryConfig{Enabled: true, Metrics: []string{writeRateKey, queryRateKey}, ReadMetrics: []string{writeRateKey}}
+	if !c.enabled("biz", writeRateKey) || c.enabled("biz", queryRateKey) {
+		t.Fatal("read metrics must follow ReadMetrics")
+	}
+	if !reflect.DeepEqual(c.metricKeys(), c.Metrics) {
+		t.Fatalf("metrics must select the write set: %v", c.metricKeys())
 	}
 	yes := true
-	c := summaryConfig{ReadOverride: &yes, Clusters: []string{"biz"}}
-	if !c.enabled("biz", writeRateKey) || c.enabled("biz", queryRateKey) {
-		t.Fatal("old config must only read write-rate")
-	}
-	c.Metrics = []string{writeRateKey, queryRateKey}
-	c.ReadMetrics = []string{writeRateKey}
-	if c.enabled("biz", queryRateKey) || !reflect.DeepEqual(c.metricKeys(), c.Metrics) {
-		t.Fatal("backfill must not enable reads")
+	if !(summaryConfig{ReadOverride: &yes}).reads() {
+		t.Fatal("read override must force reads on")
 	}
 }

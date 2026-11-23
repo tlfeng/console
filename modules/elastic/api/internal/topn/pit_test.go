@@ -2,7 +2,6 @@ package topn
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -71,15 +70,15 @@ func TestPITDialects(t *testing.T) {
 func TestQueryRouting(t *testing.T) {
 	api := pitFor(elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.16.0"})
 	for _, tc := range []struct {
-		name, source                    string
-		usePIT, failSingle, partialOpen bool
-		want                            []string
+		name, source        string
+		usePIT, partialOpen bool
+		want                []string
 	}{
-		{"node single", "node_stats", true, false, false, []string{"single"}},
-		{"node PIT fallback", "node_stats", true, true, false, []string{"single", "open", "search", "close"}},
-		{"index PIT", "index_stats", true, false, false, []string{"open", "search", "close"}},
-		{"index incomplete PIT", "index_stats", true, false, true, []string{"open", "close", "single"}},
-		{"index without PIT", "index_stats", false, false, false, []string{"single"}},
+		{"node PIT", "node_stats", true, false, []string{"open", "search", "close"}},
+		{"node incomplete PIT", "node_stats", true, true, []string{"open", "close", "single"}},
+		{"index PIT", "index_stats", true, false, []string{"open", "search", "close"}},
+		{"index incomplete PIT", "index_stats", true, false, []string{"open", "close", "single"}},
+		{"index without PIT", "index_stats", false, false, []string{"single"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := Query{Source: tc.source, Min: 1000, Max: 1999, Width: 1, N: 5, AllIndices: true}
@@ -102,9 +101,6 @@ func TestQueryRouting(t *testing.T) {
 					return result(`{"buckets":[]}`), nil
 				case strings.HasPrefix(path, "/raw/_search?"):
 					calls = append(calls, "single")
-					if tc.failSingle {
-						return nil, errors.New("single search unavailable")
-					}
 					return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
 				}
 				t.Fatalf("unexpected request %s %s", method, path)
@@ -139,8 +135,8 @@ func TestSummaryRoutingUsesSystemStorePIT(t *testing.T) {
 	}{
 		{"older Elasticsearch", elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.15.5"}, "", []string{"single"}, ""},
 		{"older OpenSearch with unrelated gap", elastic.Version{Distribution: elastic.Opensearch, Number: "2.3.0"}, "2000000000", []string{"single"}, ""},
-		{"older Elasticsearch with baseline gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "5000", nil, "summary_unavailable"},
-		{"older Elasticsearch with invalid gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "invalid", nil, "summary_unavailable"},
+		{"older Elasticsearch with baseline gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "5000", nil, "history_unavailable"},
+		{"older Elasticsearch with invalid gap", elastic.Version{Distribution: elastic.Elasticsearch, Number: "6.8.23"}, "invalid", nil, "history_unavailable"},
 		{"strict PIT fails", elastic.Version{Distribution: elastic.Elasticsearch, Number: "8.16.0"}, "", []string{"raw metadata", "open", "close"}, "query_failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,7 +167,7 @@ func TestSummaryRoutingUsesSystemStorePIT(t *testing.T) {
 				}{{tc.gap, "2000000010"}}
 			}
 			store := func() (caller, elastic.Version, string) { return call, tc.version, "test" }
-			err := calculateWithConfig(context.Background(), q, summaryMetric(queryRateKey), true, cfg, store)
+			err := calculateWithConfig(context.Background(), context.Background(), q, summaryMetric(queryRateKey), cfg, store)
 			if tc.status == "" && err != nil || tc.status != "" && (err == nil || failureStatus(err) != tc.status) {
 				t.Fatalf("err=%v, want status %q", err, tc.status)
 			}
@@ -186,7 +182,7 @@ func TestSummaryRoutingUsesSystemStorePIT(t *testing.T) {
 		t.Fatal("no monitoring store should be opened for an empty summary ACL")
 		return nil, elastic.Version{}, ""
 	}
-	if err := calculateWithConfig(context.Background(), q, summaryMetric(queryRateKey), true, cfg, store); err != nil {
+	if err := calculateWithConfig(context.Background(), context.Background(), q, summaryMetric(queryRateKey), cfg, store); err != nil {
 		t.Fatalf("empty ACL should remain an empty result: %v", err)
 	}
 }

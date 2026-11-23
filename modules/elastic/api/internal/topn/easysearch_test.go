@@ -19,6 +19,30 @@ import (
 	"infini.sh/framework/modules/elastic/common"
 )
 
+// publishTransitions mirrors the on-demand publish path for explicit test
+// transitions: prove, read, and persist one metric's score buckets.
+func publishTransitions(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, starts []int64) error {
+	for _, st := range starts {
+		if !m.covered(st-int64(q.Width)*1000, st+int64(q.Width)*1000-1) {
+			return errSummaryHistory
+		}
+	}
+	s, err := openRawSummary(ctx, call, m.raw, api)
+	if err != nil {
+		return err
+	}
+	defer s.close()
+	proof, err := rawSummaryProof(ctx, s, q, starts)
+	if err != nil {
+		return err
+	}
+	set, err := readTransitions(ctx, s, q, metric, starts)
+	if err != nil {
+		return err
+	}
+	return publishProvenBuckets(ctx, call, api, m, q, set, metric.Item.Key, proof)
+}
+
 // Use a disposable loopback Easysearch cluster. Never point this at a real monitoring store.
 func TestEasysearchSnapshot(t *testing.T) {
 	if os.Getenv("CONSOLE_TOPN_INTEGRATION") != "1" {
@@ -412,7 +436,10 @@ func TestEasysearchSnapshot(t *testing.T) {
 			metric.Field, metric.Field2 = "elapsed", "metric"
 			return metric
 		}
-		if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeMetric(), starts}, {makeLatency(), starts}}); err != nil {
+		if err := publishTransitions(ctx, call, api, m, q, makeMetric(), starts); err != nil {
+			t.Fatal(err)
+		}
+		if err := publishTransitions(ctx, call, api, m, q, makeLatency(), starts); err != nil {
 			t.Fatal(err)
 		}
 		must("POST", "/"+summary+"/_refresh", nil)
@@ -497,7 +524,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 				metric.Field2 = "absent_counter"
 				return metric
 			}
-			if err := publishTransitionBatches(ctx, call, api, m, q, []transitionBatch{{makeEmpty(), starts}}); err != nil {
+			if err := publishTransitions(ctx, call, api, m, q, makeEmpty(), starts); err != nil {
 				t.Fatal(err)
 			}
 			must("POST", "/"+summary+"/_refresh", nil)
@@ -523,7 +550,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			}
 			return call(ctx, method, path, body)
 		}
-		if err := publishProvenBuckets(ctx, denyWrite, api, m, q, [][]scoreBucket{{stale}}, []transitionBatch{{makeMetric(), starts[:1]}}, proof); err != nil {
+		if err := publishProvenBuckets(ctx, denyWrite, api, m, q, []scoreBucket{stale}, writeRateKey, proof); err != nil {
 			t.Fatal(err)
 		}
 		after := makeMetric()

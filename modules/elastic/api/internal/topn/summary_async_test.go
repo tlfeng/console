@@ -34,21 +34,6 @@ func TestOnDemandConfig(t *testing.T) {
 	}
 }
 
-func TestSummaryBackfillClusterLimit(t *testing.T) {
-	c := summaryConfig{Clusters: []string{"a", "b", "c", "d"}}
-	if err := c.validateBackfillClusters(); err != nil {
-		t.Fatal(err)
-	}
-	c.Clusters = append(c.Clusters, "e")
-	if err := c.validateBackfillClusters(); err == nil {
-		t.Fatal("expected a cluster limit for scheduled backfill")
-	}
-	c.Enabled = true
-	if err := c.validateBackfillClusters(); err != nil {
-		t.Fatalf("on-demand maintenance must not be limited by cluster count: %v", err)
-	}
-}
-
 func TestOnDemandQueue(t *testing.T) {
 	jobs := summaryQueue{jobs: make(map[string]*summaryJob), running: make(chan struct{}, 1)}
 	m := summaryMetric(writeRateKey)
@@ -75,17 +60,19 @@ func TestOnDemandQueue(t *testing.T) {
 	defer close(release)
 	for i := range summaryJobLimit {
 		k := key + string(rune('a'+i))
-		if err := jobs.submit(k, m, work); !errors.Is(err, errSummaryPending) {
+		job, err := jobs.submit(k, m, work)
+		if err != nil || job == nil {
 			t.Fatal(err)
 		}
-		if found, err := jobs.lookup(k, m); !found || !errors.Is(err, errSummaryPending) {
-			t.Fatal(found, err)
+		if found, _ := jobs.lookup(k, m); found {
+			t.Fatal("a running job must not be served")
 		}
-		if err := jobs.submit(k, m, work); !errors.Is(err, errSummaryPending) {
-			t.Fatal(err)
+		again, err := jobs.submit(k, m, work)
+		if err != nil || again != job {
+			t.Fatal("a running job must be joined, not duplicated", err)
 		}
 	}
-	if err := jobs.submit("overflow", m, work); !errors.Is(err, errSummaryBusy) {
+	if _, err := jobs.submit("overflow", m, work); !errors.Is(err, errSummaryBusy) {
 		t.Fatal(err)
 	}
 }
@@ -115,8 +102,8 @@ func TestRetainedJobSlotSaturation(t *testing.T) {
 	lookup := func() (bool, error) {
 		return lookupRetainedJob(context.Background(), nil, pitAPI{}, summaryStore{}, Query{}, m, time.Now(), key)
 	}
-	if found, err := lookup(); !found || !errors.Is(err, errSummaryPending) {
-		t.Fatalf("running job: found=%v, err=%v", found, err)
+	if found, err := lookup(); found || err != nil {
+		t.Fatalf("a running job must be reported as absent: found=%v, err=%v", found, err)
 	}
 	close(job.done)
 	if found, err := lookup(); !found || !errors.Is(err, errSummaryBusy) {
@@ -173,33 +160,26 @@ func TestReadOnDemandWithoutWriteAllowance(t *testing.T) {
 				}
 				return nil, fmt.Errorf("unexpected provisioning or publish request: %s %s", method, path)
 			}
-			if err := readOnDemand(context.Background(), call, api, m, q, metric, now, cfg, true); !errors.Is(err, errSummaryPending) {
-				t.Fatalf("must queue local computation: %v", err)
+			// The request joins the background job and returns its result directly.
+			if err := readOnDemand(context.Background(), context.Background(), call, api, m, q, metric, now, cfg); err != nil {
+				t.Fatalf("synchronous wait must return the finished job: %v", err)
 			}
 			key := summaryJobKey(m, q, metric)
-			onDemandSummaries.mu.Lock()
-			job := onDemandSummaries.jobs[key]
-			onDemandSummaries.mu.Unlock()
-			if job == nil {
-				t.Fatal("job missing")
-			}
 			t.Cleanup(func() {
 				onDemandSummaries.mu.Lock()
 				delete(onDemandSummaries.jobs, key)
 				onDemandSummaries.mu.Unlock()
 			})
-			select {
-			case <-job.done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("local computation did not finish")
-			}
-			found, err := lookupRetainedJob(context.Background(), call, api, m, q, metric, now, key)
-			if !found || err != nil || summaryReads != 2 || rawTransitions != 1 {
-				t.Fatalf("found=%v err=%v summary reads=%d raw scans=%d", found, err, summaryReads, rawTransitions)
+			if summaryReads != 2 || rawTransitions != 1 {
+				t.Fatalf("summary reads=%d raw scans=%d", summaryReads, rawTransitions)
 			}
 			want := [][]interface{}{{int64(2000), 12.0}, {int64(3000), 5.0}}
 			if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, want) {
 				t.Fatalf("expected reused summary and recomputed transition, got %v", metric.Item.Lines)
+			}
+			found, err := lookupRetainedJob(context.Background(), call, api, m, q, metric, now, key)
+			if !found || err != nil {
+				t.Fatalf("retained result must validate: found=%v err=%v", found, err)
 			}
 		})
 	}

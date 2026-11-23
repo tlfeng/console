@@ -18,7 +18,7 @@ func TestBackendTimeoutKeepsRotatedPIT(t *testing.T) {
 	}}
 	var out interface{}
 	err := s.search(ctx, dsl{}, dsl{}, &out)
-	if failureStatus(err) != "timed_out" || s.id != "after" || out != nil {
+	if failureStatus(err) != "budget_exceeded" || s.id != "after" || out != nil {
 		t.Fatalf("err=%v id=%s out=%v", err, s.id, out)
 	}
 }

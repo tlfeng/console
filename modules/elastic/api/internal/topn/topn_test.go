@@ -105,14 +105,13 @@ func TestFailureStatus(t *testing.T) {
 		err  error
 		want string
 	}{
-		{errSummaryPending, "pending"},
 		{fmt.Errorf("search: %w", errSummaryBusy), "busy"},
 		{fmt.Errorf("search: %w", errSummaryPolicyChanged), "summary_policy_changed"},
-		{errSummaryHistory, "summary_unavailable"},
-		{fmt.Errorf("open summary: %w", errSummaryTargetMissing), "summary_unavailable"},
+		{errSummaryHistory, "history_unavailable"},
+		{fmt.Errorf("open summary: %w", errSummaryTargetMissing), "history_unavailable"},
 		{errRawHistory, "history_unavailable"},
 		{fmt.Errorf("search: %w", errBudget), "budget_exceeded"},
-		{context.DeadlineExceeded, "timed_out"},
+		{context.DeadlineExceeded, "budget_exceeded"},
 		{errUnavailable, "unavailable"},
 		{errors.New("backend details"), "query_failed"},
 	} {
@@ -146,12 +145,13 @@ func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
 	metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
 	for _, selected := range [][]string{nil, {"node"}} {
 		q.selected = selected
-		if err := calculateWithConfig(context.Background(), q, metric, false, cfg, store); !errors.Is(err, errSummaryBusy) {
+		err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store)
+		if !errors.Is(err, errSummaryBusy) {
 			t.Fatalf("selection %v: slot saturation must be retryable, got %v", selected, err)
 		}
 	}
 	q.Max = q.Min + 512*1000 // 513 visible buckets.
-	if err := calculateWithConfig(context.Background(), q, metric, false, cfg, store); !errors.Is(err, errBudget) {
+	if err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store); !errors.Is(err, errBudget) {
 		t.Fatalf("oversized windows must still fail the structural budget: %v", err)
 	}
 }

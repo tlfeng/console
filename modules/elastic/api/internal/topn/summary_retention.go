@@ -197,14 +197,12 @@ func summaryProofStarts(sealed, edges []int64) []int64 {
 
 // Recheck with a fresh raw PIT before publishing; an old PIT can still hold
 // references to a backing index removed from the live alias during computation.
-func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, sets [][]scoreBucket, batches []transitionBatch, original rawBucketProof) error {
+func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, set []scoreBucket, key string, original rawBucketProof) error {
 	width := int64(q.Width) * 1000
 	var starts []int64
-	for _, set := range sets {
-		for _, b := range set {
-			if original.transition(b.Start, width) != "" {
-				starts = append(starts, b.Start)
-			}
+	for _, b := range set {
+		if original.transition(b.Start, width) != "" {
+			starts = append(starts, b.Start)
 		}
 	}
 	if len(starts) == 0 {
@@ -223,17 +221,15 @@ func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m summar
 	if err != nil {
 		return err
 	}
-	for i, set := range sets {
-		for _, b := range set {
-			b.Proof = original.transition(b.Start, width)
-			if b.Proof == "" || b.Proof != current.transition(b.Start, width) {
-				continue
-			}
-			path := "/" + m.index + "/_create/" + m.provenID(q, batches[i].metric.Item.Key, b.Start, b.Proof) + suffix
-			body := dsl{"v": b.Version, "t": b.Start, "n": b.Names, "s": b.Scores, "p": b.Proof}
-			if _, err := call(ctx, http.MethodPut, path, body); err != nil && !errors.Is(err, monitoringHTTPError(409)) {
-				return err
-			}
+	for _, b := range set {
+		b.Proof = original.transition(b.Start, width)
+		if b.Proof == "" || b.Proof != current.transition(b.Start, width) {
+			continue
+		}
+		path := "/" + m.index + "/_create/" + m.provenID(q, key, b.Start, b.Proof) + suffix
+		body := dsl{"v": b.Version, "t": b.Start, "n": b.Names, "s": b.Scores, "p": b.Proof}
+		if _, err := call(ctx, http.MethodPut, path, body); err != nil && !errors.Is(err, monitoringHTTPError(409)) {
+			return err
 		}
 	}
 	return nil

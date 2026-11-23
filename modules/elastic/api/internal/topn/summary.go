@@ -63,11 +63,11 @@ func (c summaryConfig) writes() bool {
 
 func (c summaryConfig) enabled(cluster, key string) bool {
 	return cluster != "" && c.reads() && slices.Contains(c.readMetricKeys(), key) &&
-		(c.Enabled && len(c.Clusters) == 0 || slices.Contains(c.Clusters, cluster))
+		(len(c.Clusters) == 0 || slices.Contains(c.Clusters, cluster))
 }
 
 func (c summaryConfig) store(raw string) (summaryStore, error) {
-	if c.Enabled && c.Index == "" {
+	if c.Index == "" {
 		c.Index = ".console-topn-index-rate-v2"
 	}
 	// Explicit concrete index outside the original monitoring and rollup namespace.

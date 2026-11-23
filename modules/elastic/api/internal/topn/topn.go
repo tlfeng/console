@@ -485,11 +485,14 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
+	// On-demand summary work waits inside the request instead of browser
+	// polling, so the request may outlive the five-second query budget.
+	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
+	defer cancelWait()
 	w.Header().Set("Cache-Control", "no-store")
-	err = calculate(ctx, q, metric, r.URL.Query().Get("topn_async") == "true")
-	if err == nil && ctx.Err() != nil {
-		err = ctx.Err()
-	}
+	// A nil result is only returned by searches that verified completeness or
+	// by a finished summary job, so no separate deadline recheck is needed.
+	err = calculate(ctx, waitCtx, q, metric)
 	if r.Context().Err() != nil {
 		return
 	}
@@ -506,20 +509,17 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 
 func failureStatus(err error) string {
 	switch {
-	case errors.Is(err, errSummaryPending):
-		return "pending"
 	case errors.Is(err, errSummaryBusy):
 		return "busy"
 	case errors.Is(err, errSummaryPolicyChanged):
 		return "summary_policy_changed"
-	case errors.Is(err, errSummaryHistory), errors.Is(err, errSummaryTargetMissing):
-		return "summary_unavailable"
-	case errors.Is(err, errRawHistory):
+	// Unreadable raw or summary history is one user-facing condition: the
+	// requested range cannot be evaluated from the monitoring store.
+	case errors.Is(err, errSummaryHistory), errors.Is(err, errSummaryTargetMissing), errors.Is(err, errRawHistory):
 		return "history_unavailable"
-	case errors.Is(err, errBudget):
+	// A store-side timeout is the same user advice as an exceeded budget.
+	case errors.Is(err, errBudget), errors.Is(err, context.DeadlineExceeded):
 		return "budget_exceeded"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timed_out"
 	case errors.Is(err, errUnavailable):
 		return "unavailable"
 	default:
@@ -545,7 +545,7 @@ func (cfg config) rawSource() (string, error) {
 	return index, nil
 }
 
-func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
+func calculate(ctx, waitCtx context.Context, q Query, metric Metric) error {
 	if q.selected != nil && len(q.selected) == 0 {
 		return nil
 	}
@@ -553,10 +553,10 @@ func calculate(ctx context.Context, q Query, metric Metric, poll bool) error {
 	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return errUnavailable
 	}
-	return calculateWithConfig(ctx, q, metric, poll, cfg, monitoredStore)
+	return calculateWithConfig(ctx, waitCtx, q, metric, cfg, monitoredStore)
 }
 
-func calculateWithConfig(ctx context.Context, q Query, metric Metric, poll bool, cfg config, store func() (caller, elastic.Version, string)) error {
+func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, cfg config, store func() (caller, elastic.Version, string)) error {
 	sc := cfg.TopN.Summary
 	summaryEligible := q.selected == nil && useSummary(q, metric) && sc.enabled(q.Cluster, metric.Item.Key)
 	if summaryEligible && !q.AllIndices && len(q.Indices) == 0 {
@@ -596,63 +596,54 @@ func calculateWithConfig(ctx context.Context, q Query, metric Metric, poll bool,
 			}
 		}
 	}
+	if q.selected != nil {
+		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
+	}
 	if useSummaryStore {
-		// Pending jobs need no search slot; completed jobs acquire one for validation.
-		if sc.Enabled && poll {
+		if sc.Enabled {
+			// A retained completed job is served before considering new work;
+			// a running job is joined by readOnDemand without a search slot.
 			if found, err := lookupRetainedJob(ctx, call, api, m, q, metric, time.Now(), summaryJobKey(m, q, metric)); found {
 				return err
 			}
+			return readOnDemand(ctx, waitCtx, call, api, m, q, metric, time.Now(), sc)
 		}
+		return withSlot(func() error { return readSummary(ctx, call, api, m, q, metric, time.Now()) })
 	}
+	return withSlot(func() error { return runQuery(ctx, call, api, index, pred, q, metric) })
+}
+
+// withSlot bounds the concurrent exact requests of one Console process. The
+// on-demand summary wait happens outside any slot; its background job never
+// holds one either.
+func withSlot(work func() error) error {
 	select {
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	default:
 		return errSummaryBusy
 	}
-	if q.selected != nil {
-		return runSelected(ctx, call, index, pred, q, metric)
-	}
-	if useSummaryStore {
-		if sc.Enabled {
-			return readOnDemand(ctx, call, api, m, q, metric, time.Now(), sc, poll)
-		}
-		return readSummary(ctx, call, api, m, q, metric, time.Now())
-	}
-	return runQuery(ctx, call, api, index, pred, q, metric)
+	return work()
 }
 
 func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred dsl, q Query, metric Metric) error {
-	hint, canLearn := nodeRoutingKey(q, metric, api, index)
-	learned := canLearn && pitHints.contains(hint, time.Now())
-	var singleErr error
-	singleFirst := (q.Source == "node_stats" && !learned) || api.path == ""
-	if singleFirst {
-		singleErr = singleSearch(ctx, call, index, pred, q, metric)
-		if singleErr == nil || errors.Is(singleErr, errRawHistory) || api.path == "" || ctx.Err() != nil {
-			return singleErr
-		}
+	if api.path == "" {
+		return singleSearch(ctx, call, index, pred, q, metric)
 	}
+	// Node and index charts prefer one strict snapshot; the bounded single
+	// search is the fallback when the store cannot open one.
 	s, err := open(ctx, call, index, api)
 	if err != nil {
-		if learned {
-			pitHints.forget(hint)
+		if ctx.Err() != nil {
+			return err
 		}
-		if ctx.Err() == nil && !singleFirst {
-			return singleSearch(ctx, call, index, pred, q, metric)
-		}
-		return err
+		return singleSearch(ctx, call, index, pred, q, metric)
 	}
 	defer s.close()
 	if metric.mode != peak {
-		err = paged(ctx, s, q, pred, metric)
-	} else {
-		err = peaks(ctx, s, q, pred, metric)
+		return paged(ctx, s, q, pred, metric)
 	}
-	if err == nil && canLearn && errors.Is(singleErr, errCandidateLimit) && ctx.Err() == nil {
-		pitHints.remember(hint, time.Now())
-	}
-	return err
+	return peaks(ctx, s, q, pred, metric)
 }
 
 func writeMetrics(w http.ResponseWriter, metric Metric) {

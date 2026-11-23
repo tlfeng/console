@@ -17,15 +17,13 @@ type scalar struct {
 	Value *float64 `json:"value"`
 }
 type samples struct {
-	Time       *int64     `json:"key"`
-	Count      int        `json:"doc_count"`
-	Value      *scalar    `json:"value"`
-	Other      *scalar    `json:"other"`
-	Pair       *pairedHit `json:"pair"`
-	SecondPair *pairedHit `json:"second_pair"`
-	Shards     *scalar    `json:"shards"`
-	Replicas   *scalar    `json:"replicas"`
-	Identity   *struct {
+	Time     *int64     `json:"key"`
+	Count    int        `json:"doc_count"`
+	Value    *scalar    `json:"value"`
+	Pair     *pairedHit `json:"pair"`
+	Shards   *scalar    `json:"shards"`
+	Replicas *scalar    `json:"replicas"`
+	Identity *struct {
 		Buckets []struct {
 			Key   string `json:"key"`
 			Count int    `json:"doc_count"`

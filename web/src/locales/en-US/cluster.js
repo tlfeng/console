@@ -1,11 +1,8 @@
 export default {
   "cluster.metrics.topn.summary_policy_changed": "The source lifecycle policy changed. Configure a new TopN summary index.",
-  "cluster.metrics.topn.pending": "Calculating TopN from available monitoring data…",
-  "cluster.metrics.topn.busy": "The TopN service is busy. Refresh this chart shortly.",
-  "cluster.metrics.topn.summary_unavailable": "The index metric summary does not cover this time range. Choose another range or select indices manually.",
-  "cluster.metrics.topn.history_unavailable": "The raw monitoring source is unavailable for this query.",
+  "cluster.metrics.topn.busy": "TopN is still calculating or the service is busy. Refresh this chart shortly.",
+  "cluster.metrics.topn.history_unavailable": "This time range cannot be evaluated from the monitoring data. Choose another range or select an index or node.",
   "cluster.metrics.topn.budget_exceeded": "Automatic TopN exceeded its query limit. Shorten the time range, use a larger interval, or select an index or node.",
-  "cluster.metrics.topn.timed_out": "Automatic TopN timed out. Shorten the time range, use a larger interval, or select an index or node.",
   "cluster.metrics.topn.unavailable": "Automatic TopN is unavailable in this monitoring environment. Select an index or node to view its metrics.",
   "cluster.metrics.topn.query_failed": "Automatic TopN could not be calculated. Try again or select an index or node.",
   "cluster.metrics.topn.invalid_request": "Invalid TopN time range or chart settings.",

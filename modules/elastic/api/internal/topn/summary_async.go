@@ -13,15 +13,16 @@ import (
 )
 
 const (
+	summaryBatch        = 8
 	summaryJobLimit     = 8
 	summaryJobTTL       = 2 * time.Minute
 	summaryJobTimeout   = time.Minute
+	summaryQueueLimit   = 64
 	summaryQueueTimeout = 25 * time.Second
 	summaryErrorTTL     = 5 * time.Second
 )
 
 var (
-	errSummaryPending       = errors.New("TopN is being calculated")
 	errSummaryTargetMissing = errors.New("TopN summary target not found")
 	errSummaryBusy          = errors.New("TopN processing capacity is full")
 )
@@ -130,7 +131,7 @@ func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m sum
 				eligible = append(eligible, b)
 			}
 		}
-		if err := publishProvenBuckets(ctx, call, api, m, q, [][]scoreBucket{eligible}, []transitionBatch{{metric: metric}}, proof); err != nil {
+		if err := publishProvenBuckets(ctx, call, api, m, q, eligible, metric.Item.Key, proof); err != nil {
 			log.Warnf("publish on-demand TopN summary: %v", err)
 		}
 	}
@@ -170,8 +171,8 @@ func summaryJobKey(m summaryStore, q Query, metric Metric) string {
 	return string(key)
 }
 
-// Lookup returns immutable lines only after the job has finished. Each request
-// derives the key from the permissions evaluated again by the normal handler.
+// Lookup copies a finished, unexpired job's immutable lines. A running job is
+// reported as absent; the caller joins it through submit below.
 func (jobs *summaryQueue) lookup(key string, metric Metric) (bool, error) {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
@@ -193,15 +194,26 @@ func (jobs *summaryQueue) lookup(key string, metric Metric) (bool, error) {
 		}
 		return true, job.err
 	default:
-		return true, errSummaryPending
+		return false, nil
 	}
 }
 
-func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Context, Metric) error) error {
+// Submit returns the existing job for the key, or starts one. The caller waits
+// on the returned job; the result is also retained for later requests.
+func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Context, Metric) error) (*summaryJob, error) {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
-	if jobs.jobs[key] != nil {
-		return errSummaryPending
+	if job := jobs.jobs[key]; job != nil {
+		select {
+		case <-job.done:
+			if time.Now().After(job.expires) {
+				delete(jobs.jobs, key)
+			} else {
+				return job, nil
+			}
+		default:
+			return job, nil
+		}
 	}
 	now := time.Now()
 	active := 0
@@ -215,8 +227,8 @@ func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Co
 			active++
 		}
 	}
-	if active >= summaryJobLimit || len(jobs.jobs) >= 64 {
-		return errSummaryBusy
+	if active >= summaryJobLimit || len(jobs.jobs) >= summaryQueueLimit {
+		return nil, errSummaryBusy
 	}
 	item := *metric.Item
 	item.Lines = nil
@@ -254,7 +266,7 @@ func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Co
 		defer cancel()
 		job.err = work(ctx, job.metric)
 	}()
-	return errSummaryPending
+	return job, nil
 }
 
 func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, key string) (bool, error) {
@@ -267,57 +279,79 @@ func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m summarySt
 	if !found || err != nil {
 		return found, err
 	}
-	select {
-	case slots <- struct{}{}:
-		defer func() { <-slots }()
-	default:
-		return true, errSummaryBusy
-	}
-	s, err := openRawSummary(ctx, call, m.raw, api)
-	if err != nil {
-		return true, err
-	}
-	defer s.close()
-	sealed, edges := summaryPlan(m, q, now)
-	proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
-	if err != nil {
-		return true, err
-	}
-	if expected == "" || expected != proof.digest() {
-		onDemandSummaries.mu.Lock()
-		job := onDemandSummaries.jobs[key]
-		if job != nil {
-			select {
-			case <-job.done:
-				if *job.metric.rawProof == expected {
-					delete(onDemandSummaries.jobs, key)
-				}
-			default:
-			}
+	usable := true
+	err = withSlot(func() error {
+		s, err := openRawSummary(ctx, call, m.raw, api)
+		if err != nil {
+			return err
 		}
-		onDemandSummaries.mu.Unlock()
+		defer s.close()
+		sealed, edges := summaryPlan(m, q, now)
+		proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
+		if err != nil {
+			return err
+		}
+		if expected == "" || expected != proof.digest() {
+			onDemandSummaries.mu.Lock()
+			job := onDemandSummaries.jobs[key]
+			if job != nil {
+				select {
+				case <-job.done:
+					if *job.metric.rawProof == expected {
+						delete(onDemandSummaries.jobs, key)
+					}
+				default:
+				}
+			}
+			onDemandSummaries.mu.Unlock()
+			usable = false
+			return nil
+		}
+		metric.Item.Lines = cached.Item.Lines
+		return nil
+	})
+	if !usable {
 		return false, nil
 	}
-	metric.Item.Lines = cached.Item.Lines
-	return true, nil
+	return true, err
 }
 
 func canPublishSummary(cfg summaryConfig, q Query, metric Metric) bool {
 	return cfg.writes() && q.AllIndices && slices.Contains(cfg.metricKeys(), metric.Item.Key)
 }
 
-func readOnDemand(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, cfg summaryConfig, poll bool) error {
-	err := readSummary(ctx, call, api, m, q, metric, now)
-	if !poll || !cfg.writes() {
+// readOnDemand tries the stored summaries first. Missing work is computed by
+// one background job per window; the request waits for it instead of polling.
+func readOnDemand(ctx, waitCtx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, cfg summaryConfig) error {
+	err := withSlot(func() error {
+		return readSummary(ctx, call, api, m, q, metric, now)
+	})
+	if !cfg.writes() {
 		return err
 	}
 	if !errors.Is(err, errSummaryTargetMissing) && !errors.Is(err, errSummaryMissing) {
 		return err
 	}
 	publish := canPublishSummary(cfg, q, metric)
-	return onDemandSummaries.submit(summaryJobKey(m, q, metric), metric, func(ctx context.Context, mx Metric) error {
+	job, err := onDemandSummaries.submit(summaryJobKey(m, q, metric), metric, func(ctx context.Context, mx Metric) error {
 		return computeOnDemand(ctx, call, api, m, q, mx, now, publish)
 	})
+	if err != nil {
+		return err
+	}
+	select {
+	case <-job.done:
+	case <-waitCtx.Done():
+		// The job keeps running and stays retained; a retry joins it.
+		return errSummaryBusy
+	}
+	if job.err == nil {
+		metric.Item.Lines = job.metric.Item.Lines
+		if metric.rawProof != nil && job.metric.rawProof != nil {
+			*metric.rawProof = *job.metric.rawProof
+		}
+	}
+	return job.err
 }
 
 func computeOnDemand(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, publish bool) error {

@@ -32,3 +32,17 @@ func queryTimeout(raw string) (time.Duration, error) {
 	}
 	return min(limit, d), nil
 }
+
+// summaryWaitTimeout bounds how long one request waits for an on-demand
+// summary job before reporting busy; a later request reuses the retained job.
+const summaryWaitTimeout = 30 * time.Second
+
+func queryWaitTimeout(raw string) time.Duration {
+	if raw == "" {
+		return summaryWaitTimeout
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return min(summaryWaitTimeout, d)
+	}
+	return summaryWaitTimeout
+}
