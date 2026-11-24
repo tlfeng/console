@@ -159,7 +159,7 @@ func main() {
 		orm.RegisterSchemaWithIndexName(model.EmailServer{}, "email-server")
 		orm.RegisterSchemaWithIndexName(model2.Instance{}, "instance")
 		orm.RegisterSchemaWithIndexName(api3.RemoteConfig{}, "configs")
-		orm.RegisterSchemaWithIndexName(model.AuditLog{}, "audit-logs")
+		// audit-logs is registered by framework core/event.Audit; duplicate names panic on InitSchema.
 		orm.RegisterSchemaWithIndexName(host.HostInfo{}, "host")
 
 		module.Start()
