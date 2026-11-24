@@ -111,7 +111,6 @@ func TestFailureStatus(t *testing.T) {
 		want string
 	}{
 		{fmt.Errorf("search: %w", errSummaryBusy), "busy"},
-		{fmt.Errorf("search: %w", errSummaryPolicyChanged), "summary_policy_changed"},
 		{errSummaryHistory, "history_unavailable"},
 		{fmt.Errorf("open summary: %w", errSummaryTargetMissing), "history_unavailable"},
 		{errRawHistory, "history_unavailable"},

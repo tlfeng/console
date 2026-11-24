@@ -64,7 +64,7 @@ func TestOnDemandQueue(t *testing.T) {
 		if err != nil || job == nil {
 			t.Fatal(err)
 		}
-		if found, _ := jobs.lookup(k, m); found {
+		if found, _ := jobs.retained(k, "proof", m); found {
 			t.Fatal("a running job must not be served")
 		}
 		again, err := jobs.submit(k, m, work)
@@ -77,30 +77,34 @@ func TestOnDemandQueue(t *testing.T) {
 	}
 }
 
-func TestRetainedJobSlotSaturation(t *testing.T) {
-	saturateSearchSlots(t)
-	const key = "retained-slot-test"
-	m := summaryMetric(writeRateKey)
-	saved := summaryMetric(writeRateKey)
-	saved.rawProof = new(string)
-	job := &summaryJob{done: make(chan struct{}), expires: time.Now().Add(time.Minute), metric: saved}
-	onDemandSummaries.mu.Lock()
-	onDemandSummaries.jobs[key] = job
-	onDemandSummaries.mu.Unlock()
-	defer func() {
+func TestRetainedJobRequiresMatchingProof(t *testing.T) {
+	const key = "retained-proof-test"
+	digest := "current"
+	jobMetric := summaryMetric(writeRateKey)
+	jobMetric.rawProof = &digest
+	done := make(chan struct{})
+	close(done)
+	job := &summaryJob{done: done, expires: time.Now().Add(time.Minute), metric: jobMetric}
+	add := func() {
+		onDemandSummaries.mu.Lock()
+		onDemandSummaries.jobs[key] = job
+		onDemandSummaries.mu.Unlock()
+	}
+	add()
+	t.Cleanup(func() {
 		onDemandSummaries.mu.Lock()
 		delete(onDemandSummaries.jobs, key)
 		onDemandSummaries.mu.Unlock()
-	}()
-	lookup := func() (bool, error) {
-		return lookupRetainedJob(context.Background(), nil, pitAPI{}, summaryStore{}, Query{}, m, time.Now(), key)
+	})
+	if found, _ := onDemandSummaries.retained(key, "stale", summaryMetric(writeRateKey)); found {
+		t.Fatal("a changed raw view must not reuse a retained result")
 	}
-	if found, err := lookup(); found || err != nil {
-		t.Fatalf("a running job must be reported as absent: found=%v, err=%v", found, err)
+	if _, ok := onDemandSummaries.jobs[key]; ok {
+		t.Fatal("a stale retained result must be discarded")
 	}
-	close(job.done)
-	if found, err := lookup(); !found || !errors.Is(err, errSummaryBusy) {
-		t.Fatalf("completed job must report busy when validation cannot get a slot: found=%v, err=%v", found, err)
+	add()
+	if found, err := onDemandSummaries.retained(key, digest, summaryMetric(writeRateKey)); !found || err != nil {
+		t.Fatalf("a matching result must be reused: found=%v err=%v", found, err)
 	}
 }
 
@@ -170,7 +174,7 @@ func TestReadOnDemandWithoutWriteAllowance(t *testing.T) {
 			if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, want) {
 				t.Fatalf("expected reused summary and recomputed transition, got %v", metric.Item.Lines)
 			}
-			found, err := lookupRetainedJob(context.Background(), call, api, m, q, metric, now, key)
+			found, err := onDemandSummaries.retained(key, proof.digest(), summaryMetric(tc.key))
 			if !found || err != nil {
 				t.Fatalf("retained result must validate: found=%v err=%v", found, err)
 			}
@@ -223,22 +227,6 @@ func TestMissingSummaryTargetOnlyAllowedWithoutPublishing(t *testing.T) {
 				t.Fatalf("got %v and %d searches, want %v and %d searches", err, searches, tc.want, wantSearches)
 			}
 		})
-	}
-}
-
-func TestSummaryWithoutRawPolicyDoesNotCreateIndex(t *testing.T) {
-	m := summaryStore{index: ".console-topn-test", raw: "raw"}
-	call := func(_ context.Context, method, path string, body dsl) ([]byte, error) {
-		if method != http.MethodGet {
-			t.Fatalf("unexpected mutation: %s %s", method, path)
-		}
-		if path == "/"+m.index+"/_mapping" {
-			return nil, monitoringHTTPError(404)
-		}
-		return []byte(`{"raw":{"settings":{"index.uuid":"original"}}}`), nil
-	}
-	if err := ensureSummaryIndex(context.Background(), call, m, pitAPI{}); !errors.Is(err, errSummaryNoPolicy) {
-		t.Fatal(err)
 	}
 }
 

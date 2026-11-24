@@ -66,56 +66,38 @@ func loadSummaries(ctx context.Context, call caller, api pitAPI, m summaryStore,
 	return readMetricScoreBuckets(ctx, s, q, m, metric.Item.Key, starts, proof)
 }
 
-// Each job pins one original view, including the predecessor of each segment.
-// A missing source point is not a failed page and is never persisted as coverage.
+// computeMissingSummaries fills the sealed buckets that are absent from the
+// cache, using the same view the cache was read from. It optionally publishes
+// the computed buckets for later requests.
 func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, publish bool) error {
 	if publish && m.index == "" {
 		return errSummaryTargetMissing
 	}
-	sealed, edges := summaryPlan(m, q, now)
-	s, err := openRawSummary(ctx, call, m.raw, api)
+	sc, err := beginSummary(ctx, call, api, m, q, now)
 	if err != nil {
 		return err
 	}
-	defer s.close()
-	proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
+	defer sc.close()
+	all, missing, err := sc.read(ctx, call, api, m, q, metric, !publish)
 	if err != nil {
 		return err
 	}
-	var all []scoreBucket
-	if m.index != "" {
-		all, err = loadSummaries(ctx, call, api, m, q, metric, sealed, proof)
-	}
-	// A transient calculation can fill an absent cache from the raw PIT.
-	if err != nil && !errors.Is(err, errSummaryMissing) && (publish || !errors.Is(err, errSummaryTargetMissing)) {
-		return err
-	}
-	present := make(map[int64]bool, len(all))
-	for _, b := range all {
-		present[b.Start] = true
-	}
-	todo := append([]int64(nil), edges...)
-	for _, st := range sealed {
-		if !present[st] && proof.transition(st, int64(q.Width)*1000) != "" {
-			todo = append(todo, st)
-		}
-	}
-	slices.Sort(todo)
+	slices.Sort(missing)
 	var newlyRead []scoreBucket
-	w := int64(q.Width) * 1000
-	for len(todo) > 0 {
+	width := int64(q.Width) * 1000
+	for len(missing) > 0 {
 		n := 1
-		for n < len(todo) && n < summaryBatch && todo[n]-todo[0] < summaryBatch*w {
+		for n < len(missing) && n < summaryBatch && missing[n]-missing[0] < summaryBatch*width {
 			n++
 		}
 		step, cancel := context.WithTimeout(ctx, 8*time.Second)
-		rows, err := readTransitions(step, s, q, metric, todo[:n])
+		rows, err := readTransitions(step, sc.s, q, metric, missing[:n])
 		cancel()
 		if err != nil {
 			return err
 		}
 		newlyRead = append(newlyRead, rows...)
-		todo = todo[n:]
+		missing = missing[n:]
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -125,20 +107,13 @@ func computeMissingSummaries(ctx context.Context, call caller, api pitAPI, m sum
 		return err
 	}
 	if publish && q.AllIndices {
-		var eligible []scoreBucket
-		for _, b := range newlyRead {
-			if slices.Contains(sealed, b.Start) {
-				eligible = append(eligible, b)
-			}
-		}
-		if err := publishProvenBuckets(ctx, call, api, m, q, eligible, metric.Item.Key, proof); err != nil {
+		if err := publishProvenBuckets(ctx, call, api, m, q, newlyRead, metric.Item.Key, sc.proof); err != nil {
 			log.Warnf("publish on-demand TopN summary: %v", err)
 		}
 	}
 	if metric.rawProof != nil {
-		*metric.rawProof = proof.digest()
+		*metric.rawProof = sc.proof.digest()
 	}
-
 	return nil
 }
 
@@ -171,9 +146,10 @@ func summaryJobKey(m summaryStore, q Query, metric Metric) string {
 	return string(key)
 }
 
-// Lookup copies a finished, unexpired job's immutable lines. A running job is
-// reported as absent; the caller joins it through submit below.
-func (jobs *summaryQueue) lookup(key string, metric Metric) (bool, error) {
+// retained copies a finished, unexpired result whose raw view is unchanged.
+// Only results that cannot be published are kept in memory; published
+// summaries are read back from the store instead.
+func (jobs *summaryQueue) retained(key, digest string, metric Metric) (bool, error) {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
 	job := jobs.jobs[key]
@@ -182,7 +158,7 @@ func (jobs *summaryQueue) lookup(key string, metric Metric) (bool, error) {
 	}
 	select {
 	case <-job.done:
-		if time.Now().After(job.expires) {
+		if time.Now().After(job.expires) || job.metric.rawProof == nil || *job.metric.rawProof != digest {
 			delete(jobs.jobs, key)
 			return false, nil
 		}
@@ -198,19 +174,25 @@ func (jobs *summaryQueue) lookup(key string, metric Metric) (bool, error) {
 	}
 }
 
-// Submit returns the existing job for the key, or starts one. The caller waits
-// on the returned job; the result is also retained for later requests.
+// forget drops a finished job that is not a retained read-only result.
+func (jobs *summaryQueue) forget(key string, job *summaryJob) {
+	jobs.mu.Lock()
+	if jobs.jobs[key] == job {
+		delete(jobs.jobs, key)
+	}
+	jobs.mu.Unlock()
+}
+
+// Submit returns the running job for this key, or starts one. A finished job
+// is not reused: publishable results come from the store, read-only results
+// from retained above.
 func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Context, Metric) error) (*summaryJob, error) {
 	jobs.mu.Lock()
 	defer jobs.mu.Unlock()
 	if job := jobs.jobs[key]; job != nil {
 		select {
 		case <-job.done:
-			if time.Now().After(job.expires) {
-				delete(jobs.jobs, key)
-			} else {
-				return job, nil
-			}
+			delete(jobs.jobs, key)
 		default:
 			return job, nil
 		}
@@ -269,80 +251,74 @@ func (jobs *summaryQueue) submit(key string, metric Metric, work func(context.Co
 	return job, nil
 }
 
-func lookupRetainedJob(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, key string) (bool, error) {
-	var expected string
-	copyItem := *metric.Item
-	cached := metric
-	cached.Item = &copyItem
-	cached.rawProof = &expected
-	found, err := onDemandSummaries.lookup(key, cached)
-	if !found || err != nil {
-		return found, err
-	}
-	usable := true
-	err = withSlot(func() error {
-		s, err := openRawSummary(ctx, call, m.raw, api)
-		if err != nil {
-			return err
-		}
-		defer s.close()
-		sealed, edges := summaryPlan(m, q, now)
-		proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
-		if err != nil {
-			return err
-		}
-		if expected == "" || expected != proof.digest() {
-			onDemandSummaries.mu.Lock()
-			job := onDemandSummaries.jobs[key]
-			if job != nil {
-				select {
-				case <-job.done:
-					if *job.metric.rawProof == expected {
-						delete(onDemandSummaries.jobs, key)
-					}
-				default:
-				}
-			}
-			onDemandSummaries.mu.Unlock()
-			usable = false
-			return nil
-		}
-		metric.Item.Lines = cached.Item.Lines
-		return nil
-	})
-	if !usable {
-		return false, nil
-	}
-	return true, err
-}
-
 func canPublishSummary(cfg summaryConfig, q Query, metric Metric) bool {
 	return cfg.writes() && q.AllIndices && slices.Contains(cfg.metricKeys(), metric.Item.Key)
 }
 
-// readOnDemand tries the stored summaries first. Missing work is computed by
-// one background job per window; the request waits for it instead of polling.
+// readOnDemand serves the stored summaries and fills missing sealed buckets
+// through one background job per raw view. The request joins that job instead
+// of polling; results that can be published are then read back from the store.
 func readOnDemand(ctx, waitCtx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, cfg summaryConfig) error {
-	err := withSlot(func() error {
-		return readSummary(ctx, call, api, m, q, metric, now)
-	})
-	if !cfg.writes() {
-		return err
-	}
-	if !errors.Is(err, errSummaryTargetMissing) && !errors.Is(err, errSummaryMissing) {
-		return err
-	}
+	key := summaryJobKey(m, q, metric)
 	publish := canPublishSummary(cfg, q, metric)
-	job, err := onDemandSummaries.submit(summaryJobKey(m, q, metric), metric, func(ctx context.Context, mx Metric) error {
-		return computeOnDemand(ctx, call, api, m, q, mx, now, publish)
+	var all []scoreBucket
+	var missing []int64
+	var served bool
+	err := withSlot(func() error {
+		sc, err := beginSummary(ctx, call, api, m, q, now)
+		if err != nil {
+			return err
+		}
+		defer sc.close()
+		if !publish {
+			if found, err := onDemandSummaries.retained(key, sc.digest(), metric); found || err != nil {
+				served = true
+				return err
+			}
+		}
+		all, missing, err = sc.read(ctx, call, api, m, q, metric, true)
+		if err != nil {
+			return err
+		}
+		if publish && sc.missingTarget {
+			// Setup did not provision the summary alias. Compute transiently
+			// and keep that result in this process instead of attempting writes.
+			publish = false
+			if found, err := onDemandSummaries.retained(key, sc.digest(), metric); found || err != nil {
+				served = true
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if served {
+		return nil
+	}
+	if len(missing) == 0 {
+		return summaryRank(q, metric, all)
+	}
+	if !cfg.Enabled || !cfg.writes() {
+		return errSummaryMissing
+	}
+	job, err := onDemandSummaries.submit(key, metric, func(ctx context.Context, mx Metric) error {
+		return computeMissingSummaries(ctx, call, api, m, q, mx, now, publish)
 	})
 	if err != nil {
 		return err
 	}
 	select {
 	case <-job.done:
+		if publish {
+			// Published results are read back from the store, so the lines are
+			// not retained in process memory. A transient fallback is recomputed
+			// on the next request.
+			onDemandSummaries.forget(key, job)
+		}
 	case <-waitCtx.Done():
-		// The job keeps running and stays retained; a retry joins it.
+		// The job keeps running; a retry joins it.
 		return errSummaryBusy
 	}
 	if job.err == nil {
@@ -352,15 +328,4 @@ func readOnDemand(ctx, waitCtx context.Context, call caller, api pitAPI, m summa
 		}
 	}
 	return job.err
-}
-
-func computeOnDemand(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time, publish bool) error {
-	if publish {
-		if err := ensureSummaryIndex(ctx, call, m, api); errors.Is(err, errSummaryNoPolicy) {
-			publish = false
-		} else if err != nil {
-			return err
-		}
-	}
-	return computeMissingSummaries(ctx, call, api, m, q, metric, now, publish)
 }

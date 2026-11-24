@@ -43,6 +43,24 @@ func publishTransitions(ctx context.Context, call caller, api pitAPI, m summaryS
 	return publishProvenBuckets(ctx, call, api, m, q, set, metric.Item.Key, proof)
 }
 
+// readCached mirrors the read-only summary path: cached buckets plus raw
+// edges, without computation or the process-local retained cache.
+func readCached(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time) error {
+	sc, err := beginSummary(ctx, call, api, m, q, now)
+	if err != nil {
+		return err
+	}
+	defer sc.close()
+	all, missing, err := sc.read(ctx, call, api, m, q, metric, false)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		return errSummaryMissing
+	}
+	return summaryRank(q, metric, all)
+}
+
 // integrationCaller is used only with the fixed loopback test endpoints below.
 func integrationCaller(base string) caller {
 	return func(ctx context.Context, method, path string, body dsl) ([]byte, error) {
@@ -408,9 +426,6 @@ func TestEasysearchSnapshot(t *testing.T) {
 		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
 		must("POST", "/"+alias+"/_rollover", dsl{})
 		must("PUT", "/"+alias+"/_create/"+id+"?refresh=true&require_alias=true", score)
-		if err := checkSummaryIndex(ctx, call, m); err != nil {
-			t.Fatal(err)
-		}
 		snap, err := open(ctx, call, alias, api)
 		if err != nil {
 			t.Fatal(err)
@@ -433,8 +448,8 @@ func TestEasysearchSnapshot(t *testing.T) {
 			_, _ = call(context.Background(), "DELETE", "/"+recent, nil)
 			_, _ = call(context.Background(), "DELETE", "/"+old, nil)
 		})
-		must("PUT", "/"+summary, dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "mappings": dsl{"dynamic": false, "_meta": dsl{"console_topn": summaryVersion}}})
-		t.Cleanup(func() { _, _ = call(context.Background(), "DELETE", "/"+summary, nil) })
+		must("PUT", "/"+summary+"-000001", dsl{"settings": dsl{"number_of_shards": 1, "number_of_replicas": 0}, "mappings": dsl{"dynamic": false, "_meta": dsl{"console_topn": summaryVersion}}, "aliases": dsl{summary: dsl{"is_write_index": true}}})
+		t.Cleanup(func() { _, _ = call(context.Background(), "DELETE", "/"+summary+"-000001", nil) })
 		for i, r := range []struct {
 			target          string
 			offset, counter int
@@ -460,14 +475,14 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 		must("POST", "/"+summary+"/_refresh", nil)
 		before := makeMetric()
-		if err := readSummary(ctx, call, api, m, q, before, now); err != nil {
+		if err := readCached(ctx, call, api, m, q, before, now); err != nil {
 			t.Fatal(err)
 		}
 		if got := before.Item.Lines[0].Data; !reflect.DeepEqual(got, [][]interface{}{{int64(epoch + 1000), 10.0}, {int64(epoch + 2000), 5.0}, {int64(epoch + 3000), 2.0}}) {
 			t.Fatal(got)
 		}
 		paired := makeLatency()
-		if err := readSummary(ctx, call, api, m, q, paired, now); err != nil {
+		if err := readCached(ctx, call, api, m, q, paired, now); err != nil {
 			t.Fatal(err)
 		}
 		wantLatency := [][]interface{}{{int64(epoch + 1000), 3.0}, {int64(epoch + 2000), 3.0}, {int64(epoch + 3000), 3.0}}
@@ -486,6 +501,14 @@ func TestEasysearchSnapshot(t *testing.T) {
 		digest := proof.digest()
 		before.rawProof = &digest
 		key := summaryJobKey(m, q, before)
+		qDigest := func() string {
+			sc, err := beginSummary(ctx, call, api, m, q, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sc.close()
+			return sc.digest()
+		}
 		done := make(chan struct{})
 		close(done)
 		onDemandSummaries.mu.Lock()
@@ -496,7 +519,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 			delete(onDemandSummaries.jobs, key)
 			onDemandSummaries.mu.Unlock()
 		})
-		if found, err := lookupRetainedJob(ctx, call, api, m, q, makeMetric(), now, key); !found || err != nil {
+		if found, err := onDemandSummaries.retained(key, qDigest(), makeMetric()); !found || err != nil {
 			t.Fatalf("valid cached result: %v %v", found, err)
 		}
 		t.Run("clipped job proof ignores observations outside the window", func(t *testing.T) {
@@ -519,15 +542,23 @@ func TestEasysearchSnapshot(t *testing.T) {
 			addTail := func(id string, offset int) {
 				must("PUT", "/"+tail+"/_doc/"+id+"?refresh=true", dsl{"timestamp": epoch + offset, "metric": 30, "metadata": dsl{"name": "index_stats", "category": "elasticsearch", "labels": dsl{"cluster_id": "expiry", "index_name": "a", "index_uuid": "a-uuid"}}})
 			}
+			clippedDigest := func() string {
+				sc, err := beginSummary(ctx, call, api, m, clipped, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sc.close()
+				return sc.digest()
+			}
 			addTail("outside", 3800)
 			got := makeMetric()
-			found, err := lookupRetainedJob(ctx, call, api, m, clipped, got, now, key)
+			found, err := onDemandSummaries.retained(key, clippedDigest(), got)
 			if !found || err != nil || !reflect.DeepEqual(got.Item.Lines, cached.Item.Lines) {
 				t.Fatalf("outside-window sample invalidated result: %v %v", found, err)
 			}
 			addTail("inside", 3400)
 			got = makeMetric()
-			if found, err := lookupRetainedJob(ctx, call, api, m, clipped, got, now, key); found || err != nil || len(got.Item.Lines) != 0 {
+			if found, err := onDemandSummaries.retained(key, clippedDigest(), got); found || err != nil || len(got.Item.Lines) != 0 {
 				t.Fatalf("inside-window sample did not invalidate: %v %v", found, err)
 			}
 			must("DELETE", "/"+tail+"/_doc/inside?refresh=true", nil)
@@ -545,16 +576,16 @@ func TestEasysearchSnapshot(t *testing.T) {
 			}
 			must("POST", "/"+summary+"/_refresh", nil)
 			metric := makeEmpty()
-			if err := readSummary(ctx, call, api, m, q, metric, now); err != nil || len(metric.Item.Lines) != 0 {
+			if err := readCached(ctx, call, api, m, q, metric, now); err != nil || len(metric.Item.Lines) != 0 {
 				t.Fatalf("proved empty result: %v %v", err, metric.Item.Lines)
 			}
 		})
 		must("DELETE", "/"+old, nil)
 		cached := makeMetric()
-		if found, err := lookupRetainedJob(ctx, call, api, m, q, cached, now, key); found || err != nil || len(cached.Item.Lines) != 0 {
+		if found, err := onDemandSummaries.retained(key, qDigest(), cached); found || err != nil || len(cached.Item.Lines) != 0 {
 			t.Fatalf("expired cached result: %v %v %v", found, err, cached.Item.Lines)
 		}
-		if err := readSummary(ctx, call, api, m, q, makeMetric(), now); !errors.Is(err, errSummaryMissing) {
+		if err := readCached(ctx, call, api, m, q, makeMetric(), now); !errors.Is(err, errSummaryMissing) {
 			t.Fatalf("partly expired predecessor reused: %v", err)
 		}
 		stale := newScoreBucket(starts[0])
@@ -578,7 +609,7 @@ func TestEasysearchSnapshot(t *testing.T) {
 		}
 		must("DELETE", "/"+recent, nil)
 		expired := makeMetric()
-		if err := readSummary(ctx, call, api, m, q, expired, now); err != nil || len(expired.Item.Lines) != 0 {
+		if err := readCached(ctx, call, api, m, q, expired, now); err != nil || len(expired.Item.Lines) != 0 {
 			t.Fatalf("expired points must not rank: %v %v", err, expired.Item.Lines)
 		}
 		writes := 0

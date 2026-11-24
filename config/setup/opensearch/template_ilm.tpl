@@ -158,6 +158,47 @@ POST _plugins/_ism/add/$[[SETUP_INDEX_PREFIX]]metrics-00001
   "policy_id": "ilm_$[[SETUP_INDEX_PREFIX]]metrics-30days-retention"
 }
 
+PUT /_template/.console-topn-rollover
+{
+  "order": 100,
+  "index_patterns": [".console-topn-*"],
+  "settings": {
+    "plugins.index_state_management.rollover_alias": ".console-topn-index-rate-v2",
+    "number_of_shards": "1"
+  },
+  "mappings": {
+    "dynamic": false,
+    "_meta": {
+      "console_topn": 1,
+      "raw_policy": "ilm_$[[SETUP_INDEX_PREFIX]]metrics-30days-retention"
+    },
+    "properties": {
+      "t": {
+        "type": "date",
+        "format": "epoch_millis"
+      }
+    }
+  }
+}
+
+PUT .console-topn-index-rate-v2-000001
+{
+  "settings": {
+    "index.plugins.index_state_management.rollover_alias": ".console-topn-index-rate-v2",
+    "refresh_interval": "5s"
+  },
+  "aliases": {
+    ".console-topn-index-rate-v2": {
+      "is_write_index": true
+    }
+  }
+}
+
+POST _plugins/_ism/add/.console-topn-index-rate-v2-000001
+{
+  "policy_id": "ilm_$[[SETUP_INDEX_PREFIX]]metrics-30days-retention"
+}
+
 PUT /_template/$[[SETUP_INDEX_PREFIX]]logs-rollover
 {
   "order": 100000,

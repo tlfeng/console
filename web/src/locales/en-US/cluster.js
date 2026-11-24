@@ -1,5 +1,4 @@
 export default {
-  "cluster.metrics.topn.summary_policy_changed": "The source lifecycle policy changed. Configure a new TopN summary index.",
   "cluster.metrics.topn.busy": "TopN is still calculating or the service is busy. Refresh this chart shortly.",
   "cluster.metrics.topn.history_unavailable": "This time range cannot be evaluated from the monitoring data. Choose another range or select an index or node.",
   "cluster.metrics.topn.budget_exceeded": "Automatic TopN exceeded its query limit. Shorten the time range, use a larger interval, or select an index or node.",

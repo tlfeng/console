@@ -225,6 +225,46 @@ PUT $[[SETUP_INDEX_PREFIX]]metrics-00001
     }
 }
 
+PUT _template/.console-topn-rollover
+{
+  "order": 100,
+  "index_patterns": [".console-topn-*"],
+  "settings": {
+    "index": {
+      "number_of_shards": "1",
+      "lifecycle": {
+        "name": "ilm_$[[SETUP_INDEX_PREFIX]]metrics-30days-retention",
+        "rollover_alias": ".console-topn-index-rate-v2"
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": false,
+    "_meta": {
+      "console_topn": 1,
+      "raw_policy": "ilm_$[[SETUP_INDEX_PREFIX]]metrics-30days-retention"
+    },
+    "properties": {
+      "t": {
+        "type": "date",
+        "format": "epoch_millis"
+      }
+    }
+  }
+}
+
+PUT .console-topn-index-rate-v2-000001
+{
+  "settings": {
+    "index.lifecycle.rollover_alias": ".console-topn-index-rate-v2"
+  },
+  "aliases": {
+    ".console-topn-index-rate-v2": {
+      "is_write_index": true
+    }
+  }
+}
+
 PUT _template/$[[SETUP_INDEX_PREFIX]]logs-rollover
 {
   "order": 100000,

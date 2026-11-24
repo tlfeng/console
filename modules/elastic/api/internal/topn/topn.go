@@ -511,8 +511,6 @@ func failureStatus(err error) string {
 	switch {
 	case errors.Is(err, errSummaryBusy):
 		return "busy"
-	case errors.Is(err, errSummaryPolicyChanged):
-		return "summary_policy_changed"
 	// Unreadable raw or summary history is one user-facing condition: the
 	// requested range cannot be evaluated from the monitoring store.
 	case errors.Is(err, errSummaryHistory), errors.Is(err, errSummaryTargetMissing), errors.Is(err, errRawHistory):
@@ -600,15 +598,7 @@ func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, c
 		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
 	}
 	if useSummaryStore {
-		if sc.Enabled {
-			// A retained completed job is served before considering new work;
-			// a running job is joined by readOnDemand without a search slot.
-			if found, err := lookupRetainedJob(ctx, call, api, m, q, metric, time.Now(), summaryJobKey(m, q, metric)); found {
-				return err
-			}
-			return readOnDemand(ctx, waitCtx, call, api, m, q, metric, time.Now(), sc)
-		}
-		return withSlot(func() error { return readSummary(ctx, call, api, m, q, metric, time.Now()) })
+		return readOnDemand(ctx, waitCtx, call, api, m, q, metric, time.Now(), sc)
 	}
 	return withSlot(func() error { return runQuery(ctx, call, api, index, pred, q, metric) })
 }

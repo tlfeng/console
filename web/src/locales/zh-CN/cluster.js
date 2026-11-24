@@ -1,5 +1,4 @@
 export default {
-  "cluster.metrics.topn.summary_policy_changed": "原始监控索引的生命周期策略已变化，请配置新的 TopN 摘要名称。",
   "cluster.metrics.topn.busy": "TopN 正在计算或查询繁忙，请稍后刷新图表重试。",
   "cluster.metrics.topn.history_unavailable": "无法从监控数据评估此时间范围。请选择其他时间范围，或手选索引或节点。",
   "cluster.metrics.topn.budget_exceeded": "自动 TopN 超过查询限额。请缩短时间范围、调粗粒度，或手选索引或节点。",

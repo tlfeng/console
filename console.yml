@@ -75,7 +75,8 @@ metrics:
     node_stats: true
     index_stats: true
 
-# Optional 15/30-day index TopN. Missing summaries are calculated on demand.
+# Optional 15/30-day index TopN. Setup provisions the summary template and
+# write alias; missing summaries are calculated on demand.
 # insight:
 #   topn:
 #     summary:

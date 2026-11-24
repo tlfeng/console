@@ -4,13 +4,7 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	log "github.com/cihub/seelog"
-	"infini.sh/framework/core/env"
-	"infini.sh/framework/core/task"
 )
-
-const summaryTaskID = "console-topn-summary-v1"
 
 func newScoreBucket(start int64) scoreBucket {
 	return scoreBucket{Version: summaryVersion, Start: start, Names: []string{}, Scores: []float64{}}
@@ -81,77 +75,80 @@ func readTransitions(ctx context.Context, s *snapshot, q Query, metric Metric, s
 	return out, nil
 }
 
-func readSummary(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, now time.Time) error {
-	if api.path == "" {
-		return errUnavailable
-	}
-	if !q.AllIndices && len(q.Indices) == 0 {
-		return nil
-	}
+// A summaryScan is one validated raw view of the requested window. The proof
+// binds both the cached summaries and the raw transitions to the same backing
+// indices, so a read never mixes generations.
+type summaryScan struct {
+	s             *snapshot
+	proof         rawBucketProof
+	sealed        []int64
+	edges         []int64
+	missingTarget bool
+}
+
+func beginSummary(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, now time.Time) (*summaryScan, error) {
 	if q.Max > now.UnixMilli() {
-		return errSummaryHistory
+		return nil, errSummaryHistory
 	}
 	sealed, edges := summaryPlan(m, q, now)
 	if len(edges) > 5 {
-		return errBudget
+		return nil, errBudget
 	}
 	s, err := openRawSummary(ctx, call, m.raw, api)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer s.close()
-	proof, err := rawSummaryProof(ctx, s, q, sealed)
+	proof, err := summaryProof(ctx, s, q, summaryProofStarts(sealed, edges), true)
 	if err != nil {
-		return err
+		s.close()
+		return nil, err
 	}
-	all, err := loadSummaries(ctx, call, api, m, q, metric, sealed, proof)
-	if err != nil {
-		return err
-	}
-	if len(edges) > 0 {
-		scores, err := readTransitions(ctx, s, q, metric, edges)
-		if err != nil {
-			return err
-		}
-		all = append(all, scores...)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return summaryRank(q, metric, all)
+	return &summaryScan{s: s, proof: proof, sealed: sealed, edges: edges}, nil
 }
 
-// StartSummary maintains the summary rollover target on the writer instance:
-// it provisions the bootstrap generation, binds the raw store's lifecycle
-// policy by name, and validates every generation against that binding.
-func StartSummary() {
-	var cfg config
-	if _, err := env.ParseConfig("insight", &cfg); err != nil {
-		return
-	}
-	sc := cfg.TopN.Summary
-	if !sc.writes() {
-		return
-	}
-	task.RegisterScheduleTask(task.ScheduleTask{ID: summaryTaskID, Interval: "1m", Singleton: true, Task: func(ctx context.Context) {
-		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
-		index, err := cfg.rawSource()
-		if err == nil {
-			var m summaryStore
-			m, err = sc.store(index)
-			if err == nil {
-				call, version, _ := monitoredStore()
-				if call == nil {
-					err = errUnavailable
-				} else if api := pitFor(version); api.path != "" {
-					err = ensureSummaryIndex(ctx, call, m, api)
-				}
+func (sc *summaryScan) close() { sc.s.close() }
+
+func (sc *summaryScan) digest() string { return sc.proof.digest() }
+
+// read returns the buckets this view can serve and the sealed buckets that
+// are still missing. Edges always come from raw. A missing summary index is
+// tolerated only when the caller can compute the buckets instead.
+func (sc *summaryScan) read(ctx context.Context, call caller, api pitAPI, m summaryStore, q Query, metric Metric, tolerateMissingTarget bool) ([]scoreBucket, []int64, error) {
+	var all []scoreBucket
+	if m.index != "" && len(sc.sealed) > 0 {
+		cached, err := loadSummaries(ctx, call, api, m, q, metric, sc.sealed, sc.proof)
+		switch {
+		case err == nil, errors.Is(err, errSummaryMissing):
+			all = append(all, cached...)
+		case errors.Is(err, errSummaryTargetMissing):
+			sc.missingTarget = true
+			if !tolerateMissingTarget {
+				return nil, nil, err
 			}
+		default:
+			return nil, nil, err
 		}
-		if err != nil && !errors.Is(err, errSummaryNoPolicy) {
-			log.Warnf("maintain TopN summaries: %v", err)
+	}
+	present := make(map[int64]bool, len(all))
+	for _, b := range all {
+		present[b.Start] = true
+	}
+	width := int64(q.Width) * 1000
+	var missing []int64
+	for _, st := range sc.sealed {
+		if !present[st] && sc.proof.transition(st, width) != "" {
+			missing = append(missing, st)
 		}
-	}})
+	}
+	if len(sc.edges) > 0 {
+		edges, err := readTransitions(ctx, sc.s, q, metric, sc.edges)
+		if err != nil {
+			return nil, nil, err
+		}
+		all = append(all, edges...)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return all, missing, nil
 }

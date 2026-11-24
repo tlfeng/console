@@ -217,16 +217,14 @@ func publishProvenBuckets(ctx context.Context, call caller, api pitAPI, m summar
 	if err != nil {
 		return err
 	}
-	suffix, err := summaryWriteSuffix(ctx, call, m)
-	if err != nil {
-		return err
-	}
 	for _, b := range set {
 		b.Proof = original.transition(b.Start, width)
 		if b.Proof == "" || b.Proof != current.transition(b.Start, width) {
 			continue
 		}
-		path := "/" + m.index + "/_create/" + m.provenID(q, key, b.Start, b.Proof) + suffix
+		// The summary target is the rollover alias created by setup; require it
+		// so a missing alias cannot be auto-created as a plain index.
+		path := "/" + m.index + "/_create/" + m.provenID(q, key, b.Start, b.Proof) + "?require_alias=true"
 		body := dsl{"v": b.Version, "t": b.Start, "n": b.Names, "s": b.Scores, "p": b.Proof}
 		if _, err := call(ctx, http.MethodPut, path, body); err != nil && !errors.Is(err, monitoringHTTPError(409)) {
 			return err
