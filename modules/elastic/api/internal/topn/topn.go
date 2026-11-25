@@ -91,6 +91,9 @@ type Query struct {
 	Indices         []string
 	selected        []string
 	legacyInterval  bool
+	// pageBudget overrides the interactive composite page cap for background
+	// scans; zero keeps the interactive budget.
+	pageBudget int
 }
 
 type dsl = map[string]interface{}
@@ -481,36 +484,6 @@ var slots = make(chan struct{}, 4)
 const longWindow = 24 * time.Hour
 
 var errUnavailable = errors.New("automatic TopN unavailable")
-
-// Serve owns the response for supported Advanced automatic charts. A failed
-// calculation must not be presented as a successful legacy activity ranking.
-func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
-	timeout, err := queryTimeout(r.URL.Query().Get("timeout"))
-	if err != nil {
-		WriteStatus(w, "invalid_request")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-	// Long automatic scans wait inside the request instead of browser polling,
-	// so the request may outlive the five-second query budget.
-	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
-	defer cancelWait()
-	w.Header().Set("Cache-Control", "no-store")
-	err = calculate(ctx, waitCtx, q, metric)
-	if r.Context().Err() != nil {
-		return
-	}
-	if err == nil {
-		writeMetrics(w, metric)
-		return
-	}
-	status := failureStatus(err)
-	if status == "query_failed" {
-		log.Warnf("automatic monitoring TopN: %v", err)
-	}
-	WriteStatus(w, status)
-}
 
 func failureStatus(err error) string {
 	switch {

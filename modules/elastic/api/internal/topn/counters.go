@@ -241,7 +241,7 @@ func keepWinner(best []winner, candidate winner, n int) []winner {
 
 func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
 	best := make([]winner, 0, q.N)
-	err := visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples, approx bool) error {
+	err := visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), metricScope(q, metric), metricBucketCost(q, metric), q.pageBudget, func(name string, points []samples, approx bool) error {
 		candidate, err := scoreSeries(q, metric, name, points, approx)
 		if err == nil {
 			best = keepWinner(best, candidate, q.N)
@@ -257,7 +257,10 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
-func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost int, visit func(string, []samples, bool) error) error {
+func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost, budget int, visit func(string, []samples, bool) error) error {
+	if budget <= 0 {
+		budget = maxPages
+	}
 	pred["filter"] = append(pred["filter"].([]dsl), scope)
 	// Leave headroom for per-point identity buckets plus their histogram parents.
 	size := min(pageSize, searchBucketLimit/(cost+1))
@@ -269,7 +272,7 @@ func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, s
 	allowed := q.authorizer()
 	var after, last string
 	total := 0
-	for page := 0; page < maxPages; page++ {
+	for page := 0; page < budget; page++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
