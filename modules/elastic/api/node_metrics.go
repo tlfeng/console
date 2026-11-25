@@ -207,6 +207,38 @@ func (h *APIHandler) getNodeMetrics(ctx context.Context, clusterID string, bucke
 			},
 		},
 	}
+	nodeMetricItems := nodeMetricItemsForKey(metricKey)
+
+	aggs := generateGroupAggs(nodeMetricItems)
+	intervalField, err := getDateHistogramIntervalField(global.MustLookupString(elastic.GlobalSystemElasticsearchID), bucketSizeStr)
+	if err != nil {
+		log.Error(err)
+		panic(err)
+	}
+
+	query["size"] = 0
+	query["aggs"] = util.MapStr{
+		"group_by_level": util.MapStr{
+			"terms": util.MapStr{
+				"field": "metadata.labels.transport_address",
+				"size":  top,
+			},
+			"aggs": util.MapStr{
+				"dates": util.MapStr{
+					"date_histogram": util.MapStr{
+						"field":       "timestamp",
+						intervalField: bucketSizeStr,
+					},
+					"aggs": aggs,
+				},
+			},
+		},
+	}
+	return h.getMetrics(ctx, "", query, nodeMetricItems, bucketSize)
+
+}
+
+func nodeMetricItemsForKey(metricKey string) []GroupMetricItem {
 	nodeMetricItems := []GroupMetricItem{}
 	switch metricKey {
 	case NodeProcessCPUMetricKey:
@@ -1142,34 +1174,7 @@ func (h *APIHandler) getNodeMetrics(ctx context.Context, clusterID string, bucke
 			Units:        "times/s",
 		})
 	}
-
-	aggs := generateGroupAggs(nodeMetricItems)
-	intervalField, err := getDateHistogramIntervalField(global.MustLookupString(elastic.GlobalSystemElasticsearchID), bucketSizeStr)
-	if err != nil {
-		log.Error(err)
-		panic(err)
-	}
-
-	query["size"] = 0
-	query["aggs"] = util.MapStr{
-		"group_by_level": util.MapStr{
-			"terms": util.MapStr{
-				"field": "metadata.labels.transport_address",
-				"size":  top,
-			},
-			"aggs": util.MapStr{
-				"dates": util.MapStr{
-					"date_histogram": util.MapStr{
-						"field":       "timestamp",
-						intervalField: bucketSizeStr,
-					},
-					"aggs": aggs,
-				},
-			},
-		},
-	}
-	return h.getMetrics(ctx, "", query, nodeMetricItems, bucketSize)
-
+	return nodeMetricItems
 }
 
 func (h *APIHandler) getTopNodeName(clusterID string, top int, lastMinutes int) ([]string, error) {

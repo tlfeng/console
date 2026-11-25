@@ -1,4 +1,10 @@
 export default {
+  "cluster.metrics.topn.busy": "TopN 查询繁忙，请稍后刷新图表重试。",
+  "cluster.metrics.topn.history_unavailable": "无法从监控数据评估此时间范围。请选择其他时间范围，或手选索引或节点。",
+  "cluster.metrics.topn.budget_exceeded": "自动 TopN 超过查询限额。请缩短时间范围、调粗粒度，或手选索引或节点。",
+  "cluster.metrics.topn.unavailable": "当前监控环境无法计算自动 TopN。请手选索引或节点查看指标。",
+  "cluster.metrics.topn.query_failed": "自动 TopN 查询失败。请重试，或手选索引或节点。",
+  "cluster.metrics.topn.invalid_request": "TopN 的时间范围或图表设置无效。",
   "cluster.manage.title": "集群管理",
   "cluster.manage.description":
     "集群管理可以帮助您快速接入不同版本的 Elasticsearch 集群，以及删除和修改集群配置。",

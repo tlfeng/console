@@ -29,6 +29,7 @@ import (
 	"fmt"
 	log "github.com/cihub/seelog"
 	"infini.sh/console/core"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	httprouter "infini.sh/framework/core/api/router"
 	"infini.sh/framework/core/credential"
 	"infini.sh/framework/core/elastic"
@@ -47,7 +48,6 @@ import (
 
 type APIHandler struct {
 	core.Handler
-	Config common.ModuleConfig
 }
 
 func (h *APIHandler) Client() elastic.API {
@@ -570,8 +570,32 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		return
 	}
 	indexName := h.Get(req, "index_name", "")
-	top := h.GetIntOrDefault(req, "top", 5)
 	key := h.GetParameter(req, "key")
+	if req.URL.Query().Get("advanced_topn") == "true" {
+		defs := indexMetricItemsForKey(key)
+		if len(defs) == 1 {
+			def := defs[0]
+			metric, supported := topn.NewMetric(def.MetricItem, def.Field, def.Field2, def.Units, def.FormatType, def.IsDerivative)
+			if supported {
+				q := topn.Query{Cluster: id, Source: "index_stats", Width: bucketSize}
+				if indexName != "" {
+					q.Indices, q.AllIndices = h.GetAllowedIndices(req, id)
+					topn.ServeSelected(w, req, q, metric, indexName)
+					return
+				}
+				min, max, n, valid := topn.Window(req, bucketSize)
+				if !valid {
+					topn.WriteStatus(w, "invalid_request")
+					return
+				}
+				q.Min, q.Max, q.N = min, max, n
+				q.Indices, q.AllIndices = h.GetAllowedIndices(req, id)
+				topn.Serve(w, req, q, metric)
+				return
+			}
+		}
+	}
+	top := h.GetIntOrDefault(req, "top", 5)
 	timeout := h.GetParameterOrDefault(req, "timeout", "60s")
 	du, err := time.ParseDuration(timeout)
 	if err != nil {
@@ -579,7 +603,7 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		h.WriteError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), du)
+	ctx, cancel := context.WithTimeout(req.Context(), du)
 	defer cancel()
 	var metrics map[string]*common.MetricItem
 	if key == DocPercentMetricKey {
@@ -592,6 +616,9 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		if err != nil {
 			h.WriteError(w, err, http.StatusInternalServerError)
 			return
+		}
+		if metrics == nil {
+			metrics = make(map[string]*common.MetricItem)
 		}
 		for k, v := range docsDeletedMetrics {
 			if v != nil {
@@ -660,6 +687,9 @@ func (h *APIHandler) HandleIndexMetricsAction(w http.ResponseWriter, req *http.R
 		}
 	}
 
+	if metrics == nil {
+		metrics = map[string]*common.MetricItem{}
+	}
 	resBody["metrics"] = metrics
 	ver := elastic.GetClient(global.MustLookupString(elastic.GlobalSystemElasticsearchID)).GetVersion()
 	if ver.Distribution == "" {

@@ -27,6 +27,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"infini.sh/console/modules/elastic/api/internal/topn"
 	"math"
 	"net/http"
 	"strconv"
@@ -731,11 +732,33 @@ func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Re
 		return
 	}
 	nodeName := h.Get(req, "node_name", "")
+	key := h.GetParameter(req, "key")
+	if req.URL.Query().Get("advanced_topn") == "true" && (nodeName == "" || req.URL.Query().Get("node_selector") == "transport_address") && GetMonitorState(id) == elastic.ModeAgentless {
+		defs := nodeMetricItemsForKey(key)
+		if len(defs) == 1 {
+			def := defs[0]
+			metric, supported := topn.NewMetric(def.MetricItem, def.Field, def.Field2, def.Units, def.FormatType, def.IsDerivative)
+			if supported {
+				q := topn.Query{Cluster: id, Source: "node_stats", Width: bucketSize}
+				if nodeName != "" {
+					topn.ServeSelected(w, req, q, metric, nodeName)
+					return
+				}
+				min, max, n, valid := topn.Window(req, bucketSize)
+				if !valid {
+					topn.WriteStatus(w, "invalid_request")
+					return
+				}
+				q.Min, q.Max, q.N = min, max, n
+				topn.Serve(w, req, q, metric)
+				return
+			}
+		}
+	}
 	top := h.GetIntOrDefault(req, "top", 5)
 	if bucketSize <= 60 {
 		min = min - int64(2*bucketSize*1000)
 	}
-	key := h.GetParameter(req, "key")
 	timeout := h.GetParameterOrDefault(req, "timeout", "60s")
 	du, err := time.ParseDuration(timeout)
 	if err != nil {
@@ -743,7 +766,7 @@ func (h *APIHandler) HandleNodeMetricsAction(w http.ResponseWriter, req *http.Re
 		h.WriteError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), du)
+	ctx, cancel := context.WithTimeout(req.Context(), du)
 	defer cancel()
 	metrics, err := h.getNodeMetrics(ctx, id, bucketSize, min, max, nodeName, top, key)
 	if err != nil {

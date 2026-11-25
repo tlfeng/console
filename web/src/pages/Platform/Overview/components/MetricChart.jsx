@@ -1,6 +1,7 @@
 import request, { formatResponse } from "@/utils/request";
 import { cloneDeep } from "lodash";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { formatTimeRange } from "@/lib/elasticsearch/util";
 import { formatMessage } from "umi/locale";
 import styles from "./Metrics.scss";
 import { Alert, Dropdown, Empty, Icon, Menu, message, Spin, Tooltip } from "antd";
@@ -40,15 +41,14 @@ export default (props) => {
       customRenderChart,
       instance,
       pointerUpdate,
-      handleTimeIntervalChange
+      handleTimeIntervalChange,
+      advancedTopN = false
     } = props;
   
     const [loading, setLoading] = useState(false)
 
     const [metric, setMetric] = useState()
   
-    const [isInView, setIsInView] = useState(false);
-
     const [error, setError] = useState();
   
     const observerRef = useRef({ isInView: false })
@@ -56,63 +56,160 @@ export default (props) => {
     const containerRef = useRef(null)
   
     const firstFetchRef = useRef(true)
+    const activeTopNRef = useRef()
 
     const [timeInterval, setTimeInterval] = useState()
-  
-    const fetchData = async (queryParams, fetchUrl, metricKey, timeInterval, showLoading) => {
+
+    const { min: queryMin, max: queryMax, ...selection } = queryParams || {}
+    // A relative range's expression, not its moving bounds, identifies a chart query.
+    const chartQuery = JSON.stringify([
+      fetchUrl, metricKey, timeInterval, timeout, advancedTopN, selection,
+      timeRange?.min ?? queryMin, timeRange?.max ?? queryMax
+    ])
+    const querySignature = JSON.stringify(queryParams)
+
+    const abortTopN = () => {
+      const active = activeTopNRef.current;
+      activeTopNRef.current = undefined;
+      active?.controller.abort();
+    }
+
+    const fetchData = async (params, showLoading) => {
       if (!observerRef.current.isInView || !fetchUrl) return;
+      const newQueryParams = { ...params, key: metricKey, timeout };
+      if (timeInterval) newQueryParams.bucket_size = timeInterval;
+
+      if (advancedTopN) {
+        // The server waits for on-demand work and answers once with a final
+        // status, so one request is one outcome; a newer query aborts this one.
+        activeTopNRef.current?.controller.abort();
+        const controller = new AbortController();
+        activeTopNRef.current = { key: chartQuery, controller };
+        newQueryParams.advanced_topn = true;
+        setError();
+        if (firstFetchRef.current || showLoading) setLoading(true);
+
+        let res;
+        try {
+          res = await request(fetchUrl, {
+            method: 'GET',
+            queryParams: newQueryParams,
+            ignoreTimeout: true,
+            signal: controller.signal,
+            expirys: false
+          }, false, false);
+        } catch {
+          res = undefined;
+        }
+        if (activeTopNRef.current?.controller !== controller || !observerRef.current.isInView) return;
+        activeTopNRef.current = undefined;
+        firstFetchRef.current = false;
+        const fail = (status) => {
+          setMetric(undefined);
+          setError(formatMessage({ id: `cluster.metrics.topn.${status}` }));
+        };
+        if (res?.topn_status) {
+          fail(res.topn_status);
+        } else if (res?.error || (res?.metrics?.[metricKey] && typeof res.metrics[metricKey] === 'object' && !Array.isArray(res.metrics[metricKey]))) {
+          applyResponse(res);
+        } else {
+          fail('query_failed');
+        }
+        setLoading(false);
+        return;
+      }
+
+      if (firstFetchRef.current || showLoading) setLoading(true);
+      const legacyContext = observerRef.current.legacyContext;
+      let res;
+      try {
+        res = await request(fetchUrl, {
+          method: 'GET',
+          queryParams: newQueryParams,
+          ignoreTimeout: true
+        }, false, false);
+      } catch {
+        res = undefined;
+      }
+      // Legacy requests stay uncancelled, but must not write across a mode change.
+      if (observerRef.current.legacyContext !== legacyContext) return;
+      applyResponse(res);
       if (firstFetchRef.current || showLoading) {
-        setLoading(true)
-      }
-      const newQueryParams = {
-        ...queryParams,
-        key: metricKey,
-        timeout
-      }
-      if (timeInterval) {
-        newQueryParams.bucket_size = timeInterval
-      }
-      const res = await request(fetchUrl, {
-        method: 'GET',
-        queryParams: newQueryParams,
-        ignoreTimeout: true
-      }, false, false)
-      if (res?.error) {
-        const error = formatResponse(res);
-        setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason)
-      } else if (res && !res.error) {
-        const { metrics = {} } = res || {};
-        const metric = metrics[metricKey]
-        setError()
-        setMetric(formatMetric && metric ? formatMetric(metric) : metric);
-      }
-      if (firstFetchRef.current || showLoading) {
-        setLoading(false)
-        firstFetchRef.current = false
+        setLoading(false);
+        firstFetchRef.current = false;
       }
     }
+
+    const applyResponse = (res) => {
+      if (res?.error) {
+        const error = formatResponse(res);
+        setError(error?.errorObject?.key ? formatMessage({ id: `${error?.errorObject?.key}` }) : res?.error?.reason);
+      } else if (res) {
+        const metric = res.metrics?.[metricKey];
+        setError();
+        setMetric(formatMetric && metric ? formatMetric(metric) : metric);
+      }
+    }
+
+    useLayoutEffect(() => {
+      observerRef.current.query = chartQuery;
+      observerRef.current.advancedTopN = advancedTopN;
+    }, [chartQuery, advancedTopN]);
+
+    useLayoutEffect(() => {
+      const observer = observerRef.current;
+      observer.legacyContext = {};
+      setMetric(undefined);
+      setError();
+      setLoading(false);
+      firstFetchRef.current = true;
+      return () => { observer.legacyContext = undefined; };
+    }, [advancedTopN]);
+
+    // Invalidate before I/O can report a result for an older committed query.
+    useLayoutEffect(() => {
+      if (advancedTopN) setMetric(undefined);
+      return abortTopN;
+    }, [chartQuery]);
 
     const fixFormat = (formatType, format) => {
       return formatType === 'num' && format ? `${format}a` : format
     }
-  
+
+    const currentParams = (params) => advancedTopN && timeRange?.min != null && timeRange?.max != null
+      ? { ...params, ...formatTimeRange(timeRange) }
+      : params;
+
     useEffect(() => {
-      observerRef.current.deps = cloneDeep([queryParams, fetchUrl, metricKey, timeInterval, refresh])
-      fetchData(queryParams, fetchUrl, metricKey, timeInterval, refresh)
-    }, [JSON.stringify(queryParams), fetchUrl, metricKey, timeInterval, refresh])
-  
+      const observer = observerRef.current;
+      const args = [cloneDeep(queryParams), refresh];
+      const deps = { key: chartQuery, start: () => fetchData(currentParams(args[0]), args[1]) };
+      observer.deps = deps;
+      if (observer.isInView) {
+        observer.lastDeps = deps;
+        fetchData(...args);
+      }
+    }, [querySignature, chartQuery, refresh]);
+
     useEffect(() => {
+      const state = observerRef.current;
       const observer = new IntersectionObserver(
         entries => {
           entries.forEach(entry => {
             if (entry.isIntersecting) {
-              observerRef.current.isInView = true
-              if (JSON.stringify(observerRef.current.deps) !== JSON.stringify(observerRef.current.lastDeps)) {
-                observerRef.current.lastDeps = cloneDeep(observerRef.current.deps)
-                fetchData(...observerRef.current.deps)
+              state.isInView = true;
+              const { deps } = state;
+              if (deps && deps.key === state.query && deps !== state.lastDeps) {
+                state.lastDeps = deps;
+                deps.start();
               }
             } else {
-              observerRef.current.isInView = false
+              state.isInView = false;
+              if (state.advancedTopN) {
+                abortTopN();
+                state.lastDeps = undefined;
+                setLoading(false);
+              }
             }
           });
         },
@@ -121,17 +218,11 @@ export default (props) => {
           threshold: 0,
         }
       );
-   
-      if (containerRef.current) {
-        observer.observe(containerRef.current);
-      }
-   
-      return () => {
-        if (containerRef.current) {
-          observer.unobserve(containerRef.current);
-        }
-      };
-    }, [isInView]);
+      if (containerRef.current) observer.observe(containerRef.current);
+      return () => observer.disconnect();
+    }, []);
+
+    const handleRefresh = () => fetchData(cloneDeep(currentParams(queryParams)), true);
   
     const handleChartBrush = ({ x }) => {
       if (!x) {
@@ -151,10 +242,10 @@ export default (props) => {
     };
 
     const renderChart = () => {
-      if (error) {
+      if (error && (!advancedTopN || !loading || !metric)) {
         return (
           <div style={{ height, padding: 10 }}>
-            <Alert style={{ maxHeight: '100%', overflow: 'auto', wordBreak: 'break-all'}} message={error} type="error"/>
+            <Alert style={{ maxHeight: '100%', overflow: 'auto', wordBreak: 'break-all'}} message={error} type={loading ? "info" : "error"}/>
           </div>
         )
       }
@@ -321,22 +412,7 @@ export default (props) => {
       }
     }
   
-    return (
-      <div key={metricKey} ref={containerRef} className={className} style={style}>
-        {
-                metric?.request && (
-                  <CopyToClipboard text={`GET .infini_metrics/_search\n${metric.request}`}>
-                    <Tooltip title={formatMessage({id: "cluster.metrics.request.copy"})}>
-                      <Icon 
-                        className="copyReq"
-                        type="copy" 
-                        onClick={() => message.success(formatMessage({id: "cluster.metrics.request.copy.success"}))}
-                      />
-                    </Tooltip>
-                  </CopyToClipboard>
-                )
-              }
-        <Spin spinning={loading}>
+    const heading = (
         <div className={styles.vizChartItemTitle}>
           <span>
             {chartTitle.title}
@@ -352,12 +428,30 @@ export default (props) => {
                 )
               }
               <Tooltip title={formatMessage({id: "form.button.refresh"})}>
-                <Icon className={styles.copy} type="sync" onClick={() => fetchData(...observerRef.current.deps, true)}/>
+                <Icon className={styles.copy} type="sync" onClick={handleRefresh}/>
               </Tooltip>
             </span>
           }
         </div>
-        {renderChart()}
+    );
+
+    return (
+      <div key={metricKey} ref={containerRef} className={className} style={style}>
+        {metric?.request && (
+          <CopyToClipboard text={`GET .infini_metrics/_search\n${metric.request}`}>
+            <Tooltip title={formatMessage({id: "cluster.metrics.request.copy"})}>
+              <Icon
+                className="copyReq"
+                type="copy"
+                onClick={() => message.success(formatMessage({id: "cluster.metrics.request.copy.success"}))}
+              />
+            </Tooltip>
+          </CopyToClipboard>
+        )}
+        {advancedTopN && heading}
+        <Spin spinning={loading}>
+          {!advancedTopN && heading}
+          {renderChart()}
         </Spin>
       </div>
     );

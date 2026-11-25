@@ -56,7 +56,9 @@ export const checkMetric = (key, cluster) => {
 
 export default (props) => {
 
-  const { selectedCluster, clusterID } = props
+  const { selectedCluster, clusterID, isAgent } = props
+  const mode = selectedCluster?.metric_collection_mode;
+  const advancedTopN = mode ? mode === "agentless" : !isAgent;
 
   const [param, setParam] = useState({
     tab: "cluster",
@@ -111,6 +113,7 @@ export default (props) => {
       >
         <NodeMetric
           {...props}
+          advancedTopN={advancedTopN}
           param={param}
           setParam={setParam}
           metrics={[
@@ -253,6 +256,7 @@ export default (props) => {
       >
         <IndexMetric
           {...props}
+          advancedTopN={advancedTopN}
           param={param}
           setParam={setParam}
           metrics={[

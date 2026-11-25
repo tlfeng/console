@@ -135,6 +135,23 @@ func (h *APIHandler) getIndexMetrics(ctx context.Context, req *http.Request, clu
 			log.Error(err)
 		}
 
+		allowed, all := h.GetAllowedIndices(req, clusterID)
+		if !all {
+			if len(allowed) == 0 || len(indexNames) == 0 {
+				return nil, nil
+			}
+			matcher := radix.Compile(allowed...)
+			filtered := indexNames[:0]
+			for _, name := range indexNames {
+				if matcher.Match(name) {
+					filtered = append(filtered, name)
+				}
+			}
+			if len(filtered) == 0 {
+				return nil, nil
+			}
+			indexNames = filtered
+		}
 	}
 	if len(indexNames) > 0 {
 		must = append(must, util.MapStr{
@@ -169,6 +186,76 @@ func (h *APIHandler) getIndexMetrics(ctx context.Context, req *http.Request, clu
 			},
 		},
 	}
+	indexMetricItems := indexMetricItemsForKey(metricKey)
+
+	aggs := map[string]interface{}{}
+
+	for _, metricItem := range indexMetricItems {
+		aggs[metricItem.ID] = util.MapStr{
+			"max": util.MapStr{
+				"field": metricItem.Field,
+			},
+		}
+
+		if metricItem.Field2 != "" {
+			aggs[metricItem.ID+"_field2"] = util.MapStr{
+				"max": util.MapStr{
+					"field": metricItem.Field2,
+				},
+			}
+		}
+
+		if metricItem.IsDerivative {
+			aggs[metricItem.ID+"_deriv"] = util.MapStr{
+				"derivative": util.MapStr{
+					"buckets_path": metricItem.ID,
+				},
+			}
+			if metricItem.Field2 != "" {
+				aggs[metricItem.ID+"_deriv_field2"] = util.MapStr{
+					"derivative": util.MapStr{
+						"buckets_path": metricItem.ID + "_field2",
+					},
+				}
+			}
+		}
+	}
+	intervalField, err := getDateHistogramIntervalField(global.MustLookupString(elastic.GlobalSystemElasticsearchID), bucketSizeStr)
+	if err != nil {
+		return nil, err
+	}
+
+	query["size"] = 0
+	query["aggs"] = util.MapStr{
+		"group_by_level": util.MapStr{
+			"terms": util.MapStr{
+				"field": "metadata.labels.index_name",
+				"size":  top,
+				"order": util.MapStr{
+					"max_store": "desc",
+				},
+			},
+			"aggs": util.MapStr{
+				"dates": util.MapStr{
+					"date_histogram": util.MapStr{
+						"field":       "timestamp",
+						intervalField: bucketSizeStr,
+					},
+					"aggs": aggs,
+				},
+				"max_store": util.MapStr{
+					"max": util.MapStr{
+						"field": "payload.elasticsearch.index_stats.total.store.size_in_bytes",
+					},
+				},
+			},
+		},
+	}
+	return h.getMetrics(ctx, query, indexMetricItems, bucketSize)
+
+}
+
+func indexMetricItemsForKey(metricKey string) []GroupMetricItem {
 	indexMetricItems := []GroupMetricItem{}
 	switch metricKey {
 	case IndexStorageMetricKey:
@@ -679,72 +766,7 @@ func (h *APIHandler) getIndexMetrics(ctx context.Context, req *http.Request, clu
 			Units:        "",
 		})
 	}
-
-	aggs := map[string]interface{}{}
-
-	for _, metricItem := range indexMetricItems {
-		aggs[metricItem.ID] = util.MapStr{
-			"max": util.MapStr{
-				"field": metricItem.Field,
-			},
-		}
-
-		if metricItem.Field2 != "" {
-			aggs[metricItem.ID+"_field2"] = util.MapStr{
-				"max": util.MapStr{
-					"field": metricItem.Field2,
-				},
-			}
-		}
-
-		if metricItem.IsDerivative {
-			aggs[metricItem.ID+"_deriv"] = util.MapStr{
-				"derivative": util.MapStr{
-					"buckets_path": metricItem.ID,
-				},
-			}
-			if metricItem.Field2 != "" {
-				aggs[metricItem.ID+"_deriv_field2"] = util.MapStr{
-					"derivative": util.MapStr{
-						"buckets_path": metricItem.ID + "_field2",
-					},
-				}
-			}
-		}
-	}
-	intervalField, err := getDateHistogramIntervalField(global.MustLookupString(elastic.GlobalSystemElasticsearchID), bucketSizeStr)
-	if err != nil {
-		return nil, err
-	}
-
-	query["size"] = 0
-	query["aggs"] = util.MapStr{
-		"group_by_level": util.MapStr{
-			"terms": util.MapStr{
-				"field": "metadata.labels.index_name",
-				"size":  top,
-				"order": util.MapStr{
-					"max_store": "desc",
-				},
-			},
-			"aggs": util.MapStr{
-				"dates": util.MapStr{
-					"date_histogram": util.MapStr{
-						"field":       "timestamp",
-						intervalField: bucketSizeStr,
-					},
-					"aggs": aggs,
-				},
-				"max_store": util.MapStr{
-					"max": util.MapStr{
-						"field": "payload.elasticsearch.index_stats.total.store.size_in_bytes",
-					},
-				},
-			},
-		},
-	}
-	return h.getMetrics(ctx, query, indexMetricItems, bucketSize)
-
+	return indexMetricItems
 }
 
 func (h *APIHandler) getTopIndexName(req *http.Request, clusterID string, top int, min, max int64) ([]string, error) {

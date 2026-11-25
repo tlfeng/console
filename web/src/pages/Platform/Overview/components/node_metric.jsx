@@ -76,12 +76,15 @@ export default (props) => {
     }
     if (param.node_name) {
       newParams.node_name = param.node_name;
+      if (props.advancedTopN) {
+        newParams.node_selector = "transport_address";
+      }
     }
     if (bucketSize) {
       newParams.bucket_size = bucketSize
     }
     return newParams;
-  }, [param, timeRange, bucketSize]);
+  }, [param, timeRange, bucketSize, props.advancedTopN]);
 
   const formatedNodes = React.useMemo(() => {
     if (!nodes) {
@@ -168,7 +171,8 @@ export default (props) => {
                     <div className="metric-inner-cnt">
                       {
                         item[1].map((metricKey) => (
-                          <MetricChart 
+                          <MetricChart
+                            advancedTopN={props.advancedTopN}
                             key={metricKey} 
                             instance={charts[metricKey]} 
                             pointerUpdate={pointerUpdate}
