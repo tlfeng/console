@@ -22,7 +22,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 		{name: "complete at limit", count: 192},
 		{name: "empty"},
 		{name: "sentinel", count: 193, want: errCandidateLimit},
-		{name: "reject rollup", count: 1, rollup: true, want: errRawHistory},
+		{name: "accept rollup approximation", count: 1, rollup: true},
 		{name: "partial shards", count: 1, partial: true, want: errors.New("incomplete monitoring search")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

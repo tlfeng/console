@@ -46,12 +46,16 @@ type pairedHit struct {
 	} `json:"hits"`
 }
 
-func (p samples) counterValues(metric Metric) (value, operations float64, ok bool, err error) {
+func (p samples) counterValues(metric Metric, approx bool) (value, operations float64, ok bool, err error) {
 	if metric.mode != latency {
 		value, ok = number(p.Value)
 		return value, 0, ok, nil
 	}
 	if p.Pair == nil || len(p.Pair.Hits.Rows) != 1 {
+		if approx {
+			// A rollup-backed page cannot carry a paired observation; skip the point.
+			return 0, 0, false, nil
+		}
 		return 0, 0, false, errors.New("incomplete TopN latency observation")
 	}
 	fields := p.Pair.Hits.Rows[0].Fields
@@ -68,7 +72,9 @@ func validCounter(v float64) bool {
 
 // Index transitions also carry shard and replica evidence; node transitions
 // never do, so their topology guard is always vacuous.
-func counterPoint(previous, current samples, width int64, metric Metric) (float64, bool, error) {
+// counterPoint scores one transition. The approximate variant tolerates
+// rollup-backed pages that cannot carry a paired observation.
+func counterPoint(previous, current samples, width int64, metric Metric, approx bool) (float64, bool, error) {
 	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width {
 		return 0, false, nil
 	}
@@ -80,11 +86,11 @@ func counterPoint(previous, current samples, width int64, metric Metric) (float6
 		return 0, false, nil
 	}
 
-	a, c, ok, err := previous.counterValues(metric)
+	a, c, ok, err := previous.counterValues(metric, approx)
 	if err != nil || !ok {
 		return 0, false, err
 	}
-	b, d, ok, err := current.counterValues(metric)
+	b, d, ok, err := current.counterValues(metric, approx)
 	if err != nil || !ok || b < a {
 		return 0, false, err
 	}
@@ -257,7 +263,10 @@ func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, s
 				} `json:"dates"`
 			} `json:"buckets"`
 		}
-		if err := s.search(ctx, pred, agg, &response); err != nil {
+		// Interactive pages accept rollup-backed approximations. The build path
+		// only reaches this after its strict proof succeeded on the same
+		// snapshot, so the flag is inert there.
+		if err := s.searchApprox(ctx, pred, agg, &response); err != nil {
 			return err
 		}
 		if response.Buckets == nil || len(response.Buckets) > size {

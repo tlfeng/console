@@ -49,7 +49,10 @@ func readTransitions(ctx context.Context, s *snapshot, q Query, metric Metric, s
 			byTime[*p.Time] = p
 		}
 		for i, ts := range starts {
-			v, ok, err := counterPoint(byTime[ts-w], byTime[ts], w, metric)
+			// Build provenance stays strict: a rollup-backed page cannot carry a
+			// paired observation, and interactive edges only reach here after the
+			// strict proof succeeded on the same snapshot.
+			v, ok, err := counterPoint(byTime[ts-w], byTime[ts], w, metric, false)
 			if err != nil {
 				return err
 			}

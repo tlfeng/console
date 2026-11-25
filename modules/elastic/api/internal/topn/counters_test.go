@@ -165,3 +165,14 @@ func TestCounterScopeDoesNotReadHiddenPartOfFirstBucket(t *testing.T) {
 		}
 	}
 }
+
+func TestCounterValuesApproximation(t *testing.T) {
+	latency := Metric{Item: &common.MetricItem{Key: writeLatencyKey}, Field: writeTimeField, Field2: writeCounterField, mode: latency}
+	var pairless samples
+	if _, _, ok, err := pairless.counterValues(latency, true); ok || err != nil {
+		t.Fatalf("approximate scoring must skip a missing pair: ok=%v err=%v", ok, err)
+	}
+	if _, _, _, err := pairless.counterValues(latency, false); err == nil {
+		t.Fatal("strict scoring must reject a missing pair")
+	}
+}

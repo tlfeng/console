@@ -372,6 +372,18 @@ func (r searchResponse) complete() bool {
 }
 
 func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
+	return s.query(ctx, pred, agg, result, false)
+}
+
+// searchApprox accepts rollup-backed responses for interactive chart reads.
+// They are lower precision: per-field rollups cannot guarantee paired
+// observations, and the rewritten search need not match the snapshot's shard
+// layout. Provenance and summary-document reads keep the strict variant.
+func (s *snapshot) searchApprox(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
+	return s.query(ctx, pred, agg, result, true)
+}
+
+func (s *snapshot) query(ctx context.Context, pred dsl, agg dsl, result interface{}, approx bool) error {
 	body := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": dsl{"entities": agg}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
 	if err := searchTimeout(ctx, body); err != nil {
 		return err
@@ -394,9 +406,10 @@ func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interfa
 		return context.DeadlineExceeded
 	}
 	if response.Origin != "" {
-		return errRawHistory
-	}
-	if !response.complete() || response.Shards.Total != s.shards {
+		if !approx {
+			return errRawHistory
+		}
+	} else if !response.complete() || response.Shards.Total != s.shards {
 		return errors.New("incomplete monitoring search")
 	}
 	return json.Unmarshal(response.Aggs["entities"], result)
@@ -418,7 +431,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var rank struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
+	if err := s.searchApprox(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
 		return err
 	}
 	if rank.Buckets == nil || len(rank.Buckets) > q.N {
@@ -444,7 +457,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var curves struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves); err != nil {
+	if err := s.searchApprox(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves); err != nil {
 		return err
 	}
 	if len(curves.Buckets) != len(names) {
@@ -473,6 +486,10 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 
 var slots = make(chan struct{}, 4)
 
+// longWindow is the span at which an automatic scan may use the full wait
+// budget: beyond it, scanning is the only way to produce the chart.
+const longWindow = 24 * time.Hour
+
 var errUnavailable = errors.New("automatic TopN unavailable")
 
 // Serve owns the response for supported Advanced automatic charts. A failed
@@ -485,8 +502,9 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	// On-demand summary work waits inside the request instead of browser
-	// polling, so the request may outlive the five-second query budget.
+	// On-demand summary work and long automatic scans wait inside the request
+	// instead of browser polling, so the request may outlive the five-second
+	// query budget.
 	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
 	defer cancelWait()
 	w.Header().Set("Cache-Control", "no-store")
@@ -594,13 +612,26 @@ func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, c
 			}
 		}
 	}
+	// A long automatic scan has no cheaper fallback than scanning, so it may use
+	// the full wait budget; short windows and hand-picked reads keep the
+	// interactive query deadline.
+	scanCtx := ctx
+	if time.Duration(q.Max-q.Min)*time.Millisecond >= longWindow {
+		scanCtx = waitCtx
+	}
 	if q.selected != nil {
 		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
 	}
 	if useSummaryStore {
-		return readOnDemand(ctx, waitCtx, call, api, m, q, metric, time.Now(), sc)
+		err := readOnDemand(ctx, waitCtx, call, api, m, q, metric, time.Now(), sc)
+		if errors.Is(err, errRawHistory) {
+			// The store rewrote the scan into rollup data; render the chart from
+			// the approximate interactive read instead of failing it.
+			return withSlot(func() error { return runQuery(scanCtx, call, api, index, pred, q, metric) })
+		}
+		return err
 	}
-	return withSlot(func() error { return runQuery(ctx, call, api, index, pred, q, metric) })
+	return withSlot(func() error { return runQuery(scanCtx, call, api, index, pred, q, metric) })
 }
 
 // withSlot bounds the concurrent exact requests of one Console process. The

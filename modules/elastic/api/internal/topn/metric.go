@@ -117,7 +117,9 @@ func scoreSeries(q Query, metric Metric, name string, points []samples) (winner,
 			}
 		default:
 			var err error
-			v, valid, err = counterPoint(previous, p, width, metric)
+			// scoreSeries only serves interactive chart reads, which tolerate
+			// rollup-backed pages without a paired observation.
+			v, valid, err = counterPoint(previous, p, width, metric, true)
 			if err != nil {
 				return winner{}, err
 			}

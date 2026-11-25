@@ -197,3 +197,23 @@ func TestHistogramVersionCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshotSearchAcceptsRollupApproximation(t *testing.T) {
+	s := snapshot{id: "p", shards: 1, call: func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
+		if body["pit"] == nil {
+			t.Fatal("expected a PIT search")
+		}
+		return []byte(`{"_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"origin":"rollup","aggregations":{"entities":{"buckets":[{"key":"rollup-entity","doc_count":1}]}}}`), nil
+	}}
+	q := Query{Source: "node_stats", Cluster: "biz"}
+	pred, _ := q.filter()
+	var ranks struct {
+		Buckets []bucket `json:"buckets"`
+	}
+	if err := s.search(context.Background(), pred, dsl{}, &ranks); !errors.Is(err, errRawHistory) {
+		t.Fatalf("strict provenance reads must reject rollup data: %v", err)
+	}
+	if err := s.searchApprox(context.Background(), pred, dsl{}, &ranks); err != nil || len(ranks.Buckets) != 1 {
+		t.Fatalf("interactive reads must accept rollup data: %v %v", err, ranks.Buckets)
+	}
+}
