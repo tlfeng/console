@@ -479,8 +479,9 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 
 var slots = make(chan struct{}, 4)
 
-// longWindow is the span at which an automatic scan may use the full wait
-// budget: beyond it, scanning is the only way to produce the chart.
+// longWindow is the span at which an automatic chart routes to the shared
+// background registry: beyond it, scanning is the only way to produce the
+// chart, so the interactive deadline no longer applies.
 const longWindow = 24 * time.Hour
 
 var errUnavailable = errors.New("automatic TopN unavailable")
@@ -518,7 +519,7 @@ func (cfg config) rawSource() (string, error) {
 	return index, nil
 }
 
-func calculate(ctx, waitCtx context.Context, q Query, metric Metric) error {
+func calculate(ctx context.Context, q Query, metric Metric) error {
 	if q.selected != nil && len(q.selected) == 0 {
 		return nil
 	}
@@ -526,10 +527,13 @@ func calculate(ctx, waitCtx context.Context, q Query, metric Metric) error {
 	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return errUnavailable
 	}
-	return calculateWithConfig(ctx, waitCtx, q, metric, cfg, monitoredStore)
+	return calculateWithConfig(ctx, q, metric, cfg, monitoredStore)
 }
 
-func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, cfg config, store func() (caller, elastic.Version)) error {
+// calculateWithConfig serves the interactive paths only: windows shorter than
+// longWindow and hand-picked selections. Longer automatic charts are computed
+// by the background registry in async.go, so no deadline juggling happens here.
+func calculateWithConfig(ctx context.Context, q Query, metric Metric, cfg config, store func() (caller, elastic.Version)) error {
 	pred, ok := q.filter()
 	if !ok {
 		return errUnavailable
@@ -546,17 +550,10 @@ func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, c
 		return errUnavailable
 	}
 	q.setSearchVersion(version)
-	// A long automatic scan has no cheaper fallback than scanning, so it may
-	// use the full wait budget; short windows and hand-picked reads keep the
-	// interactive query deadline.
-	scanCtx := ctx
-	if time.Duration(q.Max-q.Min)*time.Millisecond >= longWindow {
-		scanCtx = waitCtx
-	}
 	if q.selected != nil {
 		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
 	}
-	return withSlot(func() error { return runQuery(scanCtx, call, pitFor(version), index, pred, q, metric) })
+	return withSlot(func() error { return runQuery(ctx, call, pitFor(version), index, pred, q, metric) })
 }
 
 func withSlot(work func() error) error {

@@ -193,7 +193,7 @@ func TestLongWindowAsync1396(t *testing.T) {
 				traffic := &benchTraffic{}
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				start := time.Now()
-				err := calculateWithConfig(ctx, ctx, q, makeMetric(), cfg, func() (caller, elastic.Version) {
+				err := calculateWithConfig(ctx, q, makeMetric(), cfg, func() (caller, elastic.Version) {
 					return traffic.call, version
 				})
 				cancel()

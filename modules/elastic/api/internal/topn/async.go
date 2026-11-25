@@ -129,8 +129,9 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
-	// Long automatic scans wait inside the request instead of browser polling,
-	// so the request may outlive the five-second query budget.
+	// Long automatic charts route to the shared background registry; waitCtx
+	// bounds how long one request waits for its shared scan instead of the
+	// five-second query budget.
 	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
 	defer cancelWait()
 	w.Header().Set("Cache-Control", "no-store")
@@ -138,7 +139,7 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 		serveLongWindow(w, q, metric, waitCtx)
 		return
 	}
-	err = calculate(ctx, waitCtx, q, metric)
+	err = calculate(ctx, q, metric)
 	if r.Context().Err() != nil {
 		return
 	}
@@ -213,7 +214,7 @@ func runChartJob(entry *chartEntry, q Query, metric Metric, cfg config, index st
 	scan.pageBudget = asyncMaxPages
 	jobCtx, cancel := context.WithTimeout(context.Background(), asyncJobTimeout)
 	defer cancel()
-	err := calculateWithConfig(jobCtx, jobCtx, scan, metric, cfg, store)
+	err := calculateWithConfig(jobCtx, scan, metric, cfg, store)
 	entry.metric = metric
 	entry.err = err
 	if err != nil {

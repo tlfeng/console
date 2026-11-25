@@ -171,48 +171,49 @@ func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
 	metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
 	for _, selected := range [][]string{nil, {"node"}} {
 		q.selected = selected
-		err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store)
+		err := calculateWithConfig(context.Background(), q, metric, cfg, store)
 		if !errors.Is(err, errBusy) {
 			t.Fatalf("selection %v: slot saturation must be retryable, got %v", selected, err)
 		}
 	}
 	q.Max = q.Min + 512*1000 // 513 visible buckets.
-	if err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store); !errors.Is(err, errBudget) {
+	if err := calculateWithConfig(context.Background(), q, metric, cfg, store); !errors.Is(err, errBudget) {
 		t.Fatalf("oversized windows must still fail the structural budget: %v", err)
 	}
 }
 
-func TestLongWindowUsesWaitBudget(t *testing.T) {
+func TestChartJobRunsUnderOwnDeadline(t *testing.T) {
+	// The background scan runs with the job deadline, never a requester's
+	// budget: the interactive deadline of whoever happened to trigger it must
+	// not bound the shared computation.
 	var cfg config
 	cfg.TopN.RawIndex = "raw"
-	store := func(deadline *time.Time) func() (caller, elastic.Version) {
-		return func() (caller, elastic.Version) {
-			return func(ctx context.Context, _ string, _ string, _ dsl) ([]byte, error) {
+	var deadline time.Time
+	store := func() (caller, elastic.Version) {
+		return func(ctx context.Context, method, path string, _ dsl) ([]byte, error) {
+			if method == "POST" && strings.HasPrefix(path, "/raw/_pit?") {
 				if dl, ok := ctx.Deadline(); ok {
-					*deadline = dl
+					deadline = dl
 				}
-				return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
-			}, elastic.Version{}
-		}
+				return []byte(`{"pit_id":"fixed",` + allShards + `}`), nil
+			}
+			if method == "DELETE" {
+				return []byte(`{}`), nil
+			}
+			return result(`{"buckets":[]}`), nil
+		}, elastic.Version{Distribution: elastic.Easysearch, Number: "2.1.2"}
 	}
-	run := func(span int64) time.Time {
-		q := Query{Source: "index_stats", AllIndices: true, Min: 1000, Max: 1000 + span, Width: int(span / 1000 / 400 + 1), N: 5}
-		var deadline time.Time
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		waitCtx, cancelWait := context.WithTimeout(context.Background(), waitBudget)
-		defer cancelWait()
-		metric := indexingRateMetric(t)
-		if err := calculateWithConfig(ctx, waitCtx, q, metric, cfg, store(&deadline)); err != nil {
-			t.Fatalf("span %d: %v", span, err)
-		}
-		return deadline
+	q := Query{Source: "index_stats", AllIndices: true, Min: 1000, Max: 1000 + 3600*1000, Width: 3600, N: 5}
+	metric := indexingRateMetric(t)
+	entry := &chartEntry{done: make(chan struct{})}
+	runChartJob(entry, q, metric, cfg, "raw", store)
+	<-entry.done
+	if entry.err != nil {
+		t.Fatalf("job failed: %v", entry.err)
 	}
-	if short := run(3600 * 1000); short.Sub(time.Now()) > 5*time.Second {
-		t.Fatalf("short window must keep the interactive deadline: %v", short)
-	}
-	if long := run(30 * 86400 * 1000); long.Sub(time.Now()) < 20*time.Second {
-		t.Fatalf("long window must use the wait budget: %v", long)
+	remaining := time.Until(deadline)
+	if remaining < 4*time.Minute {
+		t.Fatalf("job must run under its own %v deadline, saw %v remaining", asyncJobTimeout, remaining)
 	}
 }
 
@@ -232,7 +233,7 @@ func TestLongWindowUsesRawIndex(t *testing.T) {
 		}, elastic.Version{}
 	}
 	metric := indexingRateMetric(t)
-	if err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store); err != nil || calls != 1 {
+	if err := calculateWithConfig(context.Background(), q, metric, cfg, store); err != nil || calls != 1 {
 		t.Fatalf("expected one raw query, got %d calls, err=%v", calls, err)
 	}
 }
