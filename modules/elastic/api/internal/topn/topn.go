@@ -370,35 +370,38 @@ func (r searchResponse) complete() bool {
 	return r.Shards.complete() && r.TimedOut != nil && !*r.TimedOut && !r.Terminated
 }
 
-func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
+// search runs one aggregate read on the snapshot and reports whether the
+// store served it from rollup data. A rollup-backed page is a lower-precision
+// approximation: the rewritten search runs on different indices, so its shard
+// layout need not match the snapshot's raw layout, and it cannot carry the
+// paired latency observation.
+func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) (bool, error) {
 	body := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": dsl{"entities": agg}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
 	if err := searchTimeout(ctx, body); err != nil {
-		return err
+		return false, err
 	}
 	raw, err := s.call(ctx, http.MethodPost, "/_search?allow_partial_search_results=false", body)
 	if err != nil && len(raw) == 0 {
-		return err
+		return false, err
 	}
 	var response searchResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return err
+		return false, err
 	}
 	if response.ID != "" {
 		s.id = response.ID
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if response.TimedOut != nil && *response.TimedOut {
-		return context.DeadlineExceeded
+		return false, context.DeadlineExceeded
 	}
-	if response.Origin != "" {
-		return errRawHistory
+	rollup := response.Origin != ""
+	if !rollup && (!response.complete() || response.Shards.Total != s.shards) {
+		return false, errors.New("incomplete monitoring search")
 	}
-	if !response.complete() || response.Shards.Total != s.shards {
-		return errors.New("incomplete monitoring search")
-	}
-	return json.Unmarshal(response.Aggs["entities"], result)
+	return rollup, json.Unmarshal(response.Aggs["entities"], result)
 }
 
 func terms(field string, n int) dsl { return dsl{"field": field, "size": n, "shard_size": n} }
@@ -417,7 +420,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var rank struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
+	if _, err := s.search(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
 		return err
 	}
 	if rank.Buckets == nil || len(rank.Buckets) > q.N {
@@ -443,7 +446,8 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var curves struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves); err != nil {
+	rollup, err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves)
+	if err != nil {
 		return err
 	}
 	if len(curves.Buckets) != len(names) {
@@ -455,7 +459,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 		if !ok || data[b.Key] != nil || b.Dates == nil || len(b.Dates.Buckets) == 0 {
 			return errors.New("invalid TopN curve")
 		}
-		row, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
+		row, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets, rollup)
 		if err != nil {
 			return err
 		}
@@ -472,6 +476,10 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 
 var slots = make(chan struct{}, 4)
 
+// longWindow is the span at which an automatic scan may use the full wait
+// budget: beyond it, scanning is the only way to produce the chart.
+const longWindow = 24 * time.Hour
+
 var errUnavailable = errors.New("automatic TopN unavailable")
 
 // Serve owns the response for supported Advanced automatic charts. A failed
@@ -484,8 +492,12 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
+	// Long automatic scans wait inside the request instead of browser polling,
+	// so the request may outlive the five-second query budget.
+	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
+	defer cancelWait()
 	w.Header().Set("Cache-Control", "no-store")
-	err = calculate(ctx, q, metric)
+	err = calculate(ctx, waitCtx, q, metric)
 	if r.Context().Err() != nil {
 		return
 	}
@@ -533,7 +545,7 @@ func (cfg config) rawSource() (string, error) {
 	return index, nil
 }
 
-func calculate(ctx context.Context, q Query, metric Metric) error {
+func calculate(ctx, waitCtx context.Context, q Query, metric Metric) error {
 	if q.selected != nil && len(q.selected) == 0 {
 		return nil
 	}
@@ -541,10 +553,10 @@ func calculate(ctx context.Context, q Query, metric Metric) error {
 	if _, err := env.ParseConfig("insight", &cfg); err != nil {
 		return errUnavailable
 	}
-	return calculateWithConfig(ctx, q, metric, cfg, monitoredStore)
+	return calculateWithConfig(ctx, waitCtx, q, metric, cfg, monitoredStore)
 }
 
-func calculateWithConfig(ctx context.Context, q Query, metric Metric, cfg config, store func() (caller, elastic.Version)) error {
+func calculateWithConfig(ctx, waitCtx context.Context, q Query, metric Metric, cfg config, store func() (caller, elastic.Version)) error {
 	pred, ok := q.filter()
 	if !ok {
 		return errUnavailable
@@ -561,10 +573,17 @@ func calculateWithConfig(ctx context.Context, q Query, metric Metric, cfg config
 		return errUnavailable
 	}
 	q.setSearchVersion(version)
+	// A long automatic scan has no cheaper fallback than scanning, so it may
+	// use the full wait budget; short windows and hand-picked reads keep the
+	// interactive query deadline.
+	scanCtx := ctx
+	if time.Duration(q.Max-q.Min)*time.Millisecond >= longWindow {
+		scanCtx = waitCtx
+	}
 	if q.selected != nil {
 		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
 	}
-	return withSlot(func() error { return runQuery(ctx, call, pitFor(version), index, pred, q, metric) })
+	return withSlot(func() error { return runQuery(scanCtx, call, pitFor(version), index, pred, q, metric) })
 }
 
 func withSlot(work func() error) error {

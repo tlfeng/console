@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"infini.sh/framework/core/elastic"
 	"infini.sh/framework/modules/elastic/common"
@@ -96,8 +97,30 @@ func TestIncompleteSnapshotSearch(t *testing.T) {
 	var rows struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil || s.id != "rotated" {
+	if _, err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil || s.id != "rotated" {
 		t.Fatalf("err=%v pit=%s", err, s.id)
+	}
+}
+
+func TestRollupBackedSnapshotSearch(t *testing.T) {
+	// A rollup rewrite serves the search from different indices: the response
+	// carries a foreign origin and a different shard layout, but still ranks.
+	s := snapshot{id: "fixed", shards: 3, call: func(context.Context, string, string, dsl) ([]byte, error) {
+		return []byte(`{"origin":"rollup","pit_id":"rotated","_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"entities":{"buckets":[{"key":"entity","peak":{"value":5}}]}}}`), nil
+	}}
+	var rows struct {
+		Buckets []bucket `json:"buckets"`
+	}
+	rollup, err := s.search(context.Background(), dsl{}, dsl{}, &rows)
+	if err != nil || !rollup || s.id != "rotated" || len(rows.Buckets) != 1 {
+		t.Fatalf("rollup=%v err=%v pit=%s rows=%v", rollup, err, s.id, rows.Buckets)
+	}
+	// A raw page must still match the snapshot's own shard layout.
+	s = snapshot{id: "fixed", shards: 3, call: func(context.Context, string, string, dsl) ([]byte, error) {
+		return []byte(`{"_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"entities":{"buckets":[]}}}`), nil
+	}}
+	if _, err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil {
+		t.Fatal("raw page with a foreign shard layout was accepted")
 	}
 }
 
@@ -148,14 +171,48 @@ func TestSearchSlotSaturationAndStructuralBudget(t *testing.T) {
 	metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
 	for _, selected := range [][]string{nil, {"node"}} {
 		q.selected = selected
-		err := calculateWithConfig(context.Background(), q, metric, cfg, store)
+		err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store)
 		if !errors.Is(err, errBusy) {
 			t.Fatalf("selection %v: slot saturation must be retryable, got %v", selected, err)
 		}
 	}
 	q.Max = q.Min + 512*1000 // 513 visible buckets.
-	if err := calculateWithConfig(context.Background(), q, metric, cfg, store); !errors.Is(err, errBudget) {
+	if err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store); !errors.Is(err, errBudget) {
 		t.Fatalf("oversized windows must still fail the structural budget: %v", err)
+	}
+}
+
+func TestLongWindowUsesWaitBudget(t *testing.T) {
+	var cfg config
+	cfg.TopN.RawIndex = "raw"
+	store := func(deadline *time.Time) func() (caller, elastic.Version) {
+		return func() (caller, elastic.Version) {
+			return func(ctx context.Context, _ string, _ string, _ dsl) ([]byte, error) {
+				if dl, ok := ctx.Deadline(); ok {
+					*deadline = dl
+				}
+				return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
+			}, elastic.Version{}
+		}
+	}
+	run := func(span int64) time.Time {
+		q := Query{Source: "index_stats", AllIndices: true, Min: 1000, Max: 1000 + span, Width: int(span / 1000 / 400 + 1), N: 5}
+		var deadline time.Time
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), waitBudget)
+		defer cancelWait()
+		metric := indexingRateMetric(t)
+		if err := calculateWithConfig(ctx, waitCtx, q, metric, cfg, store(&deadline)); err != nil {
+			t.Fatalf("span %d: %v", span, err)
+		}
+		return deadline
+	}
+	if short := run(3600 * 1000); short.Sub(time.Now()) > 5*time.Second {
+		t.Fatalf("short window must keep the interactive deadline: %v", short)
+	}
+	if long := run(30 * 86400 * 1000); long.Sub(time.Now()) < 20*time.Second {
+		t.Fatalf("long window must use the wait budget: %v", long)
 	}
 }
 
@@ -175,7 +232,7 @@ func TestLongWindowUsesRawIndex(t *testing.T) {
 		}, elastic.Version{}
 	}
 	metric := indexingRateMetric(t)
-	if err := calculateWithConfig(context.Background(), q, metric, cfg, store); err != nil || calls != 1 {
+	if err := calculateWithConfig(context.Background(), context.Background(), q, metric, cfg, store); err != nil || calls != 1 {
 		t.Fatalf("expected one raw query, got %d calls, err=%v", calls, err)
 	}
 }

@@ -21,6 +21,8 @@ type samples struct {
 	Count    int        `json:"doc_count"`
 	Value    *scalar    `json:"value"`
 	Pair     *pairedHit `json:"pair"`
+	First    *scalar    `json:"first"`
+	Second   *scalar    `json:"second"`
 	Shards   *scalar    `json:"shards"`
 	Replicas *scalar    `json:"replicas"`
 	Identity *struct {
@@ -46,12 +48,24 @@ type pairedHit struct {
 	} `json:"hits"`
 }
 
-func (p samples) counterValues(metric Metric) (value, operations float64, ok bool, err error) {
+// counterValues reads one bucket's counters. Latency prefers the paired
+// observation; a rollup-backed page (approx) cannot carry one, so it falls
+// back to the per-field maxima, whose difference approximates the same
+// transition for monotonic counters. Without them the point is skipped.
+func (p samples) counterValues(metric Metric, approx bool) (value, operations float64, ok bool, err error) {
 	if metric.mode != latency {
 		value, ok = number(p.Value)
 		return value, 0, ok, nil
 	}
 	if p.Pair == nil || len(p.Pair.Hits.Rows) != 1 {
+		if approx {
+			a, okA := validMaximum(p.First)
+			b, okB := validMaximum(p.Second)
+			if okA && okB {
+				return a, b, true, nil
+			}
+			return 0, 0, false, nil
+		}
 		return 0, 0, false, errors.New("incomplete TopN latency observation")
 	}
 	fields := p.Pair.Hits.Rows[0].Fields
@@ -62,13 +76,23 @@ func (p samples) counterValues(metric Metric) (value, operations float64, ok boo
 	return a[0], b[0], true, nil
 }
 
+func validMaximum(s *scalar) (float64, bool) {
+	if s == nil || s.Value == nil {
+		return 0, false
+	}
+	if !validCounter(*s.Value) {
+		return 0, false
+	}
+	return *s.Value, true
+}
+
 func validCounter(v float64) bool {
 	return v >= 0 && !math.IsInf(v, 0)
 }
 
 // Index transitions also carry shard and replica evidence; node transitions
 // never do, so their topology guard is always vacuous.
-func counterPoint(previous, current samples, width int64, metric Metric) (float64, bool, error) {
+func counterPoint(previous, current samples, width int64, metric Metric, approx bool) (float64, bool, error) {
 	if previous.Time == nil || current.Time == nil || *current.Time-*previous.Time != width {
 		return 0, false, nil
 	}
@@ -80,11 +104,11 @@ func counterPoint(previous, current samples, width int64, metric Metric) (float6
 		return 0, false, nil
 	}
 
-	a, c, ok, err := previous.counterValues(metric)
+	a, c, ok, err := previous.counterValues(metric, approx)
 	if err != nil || !ok {
 		return 0, false, err
 	}
-	b, d, ok, err := current.counterValues(metric)
+	b, d, ok, err := current.counterValues(metric, approx)
 	if err != nil || !ok || b < a {
 		return 0, false, err
 	}
@@ -170,6 +194,11 @@ func metricAggs(q Query, metric Metric) dsl {
 	buckets := counterEvidence(q)
 	if metric.mode == latency {
 		buckets["pair"] = latencyPair(metric)
+		// The per-field maxima back the rollup approximation: a rewritten page
+		// cannot carry the paired observation, but the difference of monotonic
+		// counter maxima still bounds the same transition.
+		buckets["first"] = maximum(metric.Field)
+		buckets["second"] = maximum(metric.Field2)
 	} else {
 		buckets["value"] = maximum(metric.Field)
 	}
@@ -212,8 +241,8 @@ func keepWinner(best []winner, candidate winner, n int) []winner {
 
 func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
 	best := make([]winner, 0, q.N)
-	err := visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples) error {
-		candidate, err := scoreSeries(q, metric, name, points)
+	err := visitBucketAggs(ctx, s, q, pred, metricAggs(q, metric), metricScope(q, metric), metricBucketCost(q, metric), func(name string, points []samples, approx bool) error {
+		candidate, err := scoreSeries(q, metric, name, points, approx)
 		if err == nil {
 			best = keepWinner(best, candidate, q.N)
 		}
@@ -228,7 +257,7 @@ func paged(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	return nil
 }
 
-func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost int, visit func(string, []samples) error) error {
+func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, scope dsl, cost int, visit func(string, []samples, bool) error) error {
 	pred["filter"] = append(pred["filter"].([]dsl), scope)
 	// Leave headroom for per-point identity buckets plus their histogram parents.
 	size := min(pageSize, searchBucketLimit/(cost+1))
@@ -257,7 +286,8 @@ func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, s
 				} `json:"dates"`
 			} `json:"buckets"`
 		}
-		if err := s.search(ctx, pred, agg, &response); err != nil {
+		rollup, err := s.search(ctx, pred, agg, &response)
+		if err != nil {
 			return err
 		}
 		if response.Buckets == nil || len(response.Buckets) > size {
@@ -273,7 +303,7 @@ func visitBucketAggs(ctx context.Context, s *snapshot, q Query, pred, buckets, s
 			if total > maxPoints {
 				return errBudget
 			}
-			if err := visit(name, b.Dates.Buckets); err != nil {
+			if err := visit(name, b.Dates.Buckets, rollup); err != nil {
 				return err
 			}
 		}

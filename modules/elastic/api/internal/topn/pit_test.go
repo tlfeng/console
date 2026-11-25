@@ -51,7 +51,7 @@ func TestPITDialects(t *testing.T) {
 				t.Fatal(err)
 			}
 			var value struct{}
-			if err := s.search(context.Background(), dsl{}, dsl{}, &value); err != nil {
+			if _, err := s.search(context.Background(), dsl{}, dsl{}, &value); err != nil {
 				t.Fatal(err)
 			}
 			s.close()

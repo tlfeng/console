@@ -46,13 +46,14 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return err
 	}
-	if response.Origin != "" {
-		return errRawHistory
-	}
 	if response.TimedOut != nil && *response.TimedOut {
 		return context.DeadlineExceeded
 	}
-	if !response.complete() {
+	// A rollup-backed response is an accepted approximation: the rewritten
+	// search's shard layout need not match the original index. Latency pairs it
+	// cannot provide are skipped by the approximate scoring below.
+	rollup := response.Origin != ""
+	if !rollup && !response.complete() {
 		return errors.New("incomplete monitoring search")
 	}
 	var scan struct {
@@ -94,7 +95,7 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		if truncated {
 			continue
 		}
-		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
+		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets, rollup)
 		if err != nil {
 			return err
 		}

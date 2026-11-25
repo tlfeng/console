@@ -32,3 +32,17 @@ func queryTimeout(raw string) (time.Duration, error) {
 	}
 	return min(limit, d), nil
 }
+
+// queryWaitTimeout bounds how long one request may wait for a long automatic
+// scan that has no cheaper fallback than scanning.
+const waitBudget = 30 * time.Second
+
+func queryWaitTimeout(raw string) time.Duration {
+	if raw == "" {
+		return waitBudget
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return min(waitBudget, d)
+	}
+	return waitBudget
+}
