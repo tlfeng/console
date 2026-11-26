@@ -2,9 +2,9 @@ package topn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -23,7 +23,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 		{name: "complete at limit", count: 192},
 		{name: "empty"},
 		{name: "sentinel", count: 193, want: errCandidateLimit},
-		{name: "approximate rollup", count: 1, rollup: true},
+		{name: "reject unexpected rollup", count: 1, rollup: true, want: errors.New("unexpected monitoring search source")},
 		{name: "partial shards", count: 1, partial: true, want: errors.New("incomplete monitoring search")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -32,6 +32,10 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 				calls++
 				if method != "POST" || !strings.HasPrefix(path, "/raw/_search?") || body["pit"] != nil {
 					t.Fatalf("unexpected search: %s %s", method, path)
+				}
+				query, err := json.Marshal(body["query"])
+				if err != nil || !strings.Contains(string(query), `"gte":1000,"lte":1999`) {
+					t.Fatalf("missing time scope in top-level query: %s (%v)", query, err)
 				}
 				var entities []string
 				for i := 0; i < tc.count; i++ {
@@ -44,7 +48,7 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 				if tc.rollup {
 					shards += `,"origin":"rollup"`
 				}
-				return []byte(fmt.Sprintf(`{%s,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[%s]}}}}`, shards, strings.Join(entities, ","))), nil
+				return []byte(fmt.Sprintf(`{%s,"timed_out":false,"aggregations":{"entities":{"buckets":[%s]}}}`, shards, strings.Join(entities, ","))), nil
 			}
 			pred, _ := q.filter()
 			metric := Metric{Item: &common.MetricItem{Key: "cpu"}, Field: "cpu"}
@@ -65,37 +69,5 @@ func TestSingleSearchCompleteOrReject(t *testing.T) {
 				t.Fatal("zero scores were dropped or ties were reordered")
 			}
 		})
-	}
-}
-
-func TestSingleSearchApproximatesRollupLatency(t *testing.T) {
-	q := Query{Source: "node_stats", Min: 1000, Max: 2999, Width: 1, N: 1}
-	metric := Metric{Item: &common.MetricItem{Key: "query_latency"}, Field: "elapsed", Field2: "ops", mode: latency}
-	const identity = `"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]}`
-	bucket := func(key int64, elapsed, ops int) string {
-		return fmt.Sprintf(`{"key":%d,%s,"first":{"value":%d},"second":{"value":%d}}`, key, identity, elapsed, ops)
-	}
-	// The rewrite serves rolled pages that cannot carry the paired observation;
-	// the per-field maxima still approximate the transitions.
-	call := func(_ context.Context, _, _ string, _ dsl) ([]byte, error) {
-		entities := fmt.Sprintf(`{"key":"n1","dates":{"buckets":[%s,%s]}}`, bucket(1000, 100, 10), bucket(2000, 160, 12))
-		return []byte(fmt.Sprintf(`{"origin":"rollup","_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[%s]}}}}`, entities)), nil
-	}
-	pred, _ := q.filter()
-	if err := singleSearch(context.Background(), call, "raw", pred, q, metric); err != nil {
-		t.Fatal(err)
-	}
-	want := [][]interface{}{{int64(2000), 30.0}}
-	if len(metric.Item.Lines) != 1 || !reflect.DeepEqual(metric.Item.Lines[0].Data, want) {
-		t.Fatalf("lines=%v", metric.Item.Lines)
-	}
-	// A raw page without the paired aggregation keeps its strict rejection.
-	strict := Metric{Item: &common.MetricItem{Key: "query_latency"}, Field: "elapsed", Field2: "ops", mode: latency}
-	callRaw := func(_ context.Context, _, _ string, _ dsl) ([]byte, error) {
-		entities := fmt.Sprintf(`{"key":"n1","dates":{"buckets":[%s,%s]}}`, bucket(1000, 100, 10), bucket(2000, 160, 12))
-		return []byte(fmt.Sprintf(`{"_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[%s]}}}}`, entities)), nil
-	}
-	if err := singleSearch(context.Background(), callRaw, "raw", pred, q, strict); err == nil {
-		t.Fatal("raw page accepted a missing paired observation")
 	}
 }

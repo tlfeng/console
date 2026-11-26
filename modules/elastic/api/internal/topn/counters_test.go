@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"reflect"
 	"testing"
 
@@ -29,66 +28,36 @@ func TestCounterPoint(t *testing.T) {
 	current := parseSample(t, `{"key":2000,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"value":{"value":60},"pair":{"hits":{"hits":[{"fields":{"elapsed":[60],"ops":[7]}}]}}}`)
 	paired := Metric{mode: latency, Field: "elapsed", Field2: "ops"}
 	rateMetric := Metric{mode: rate}
-	if score, ok, err := counterPoint(previous, current, 1000, paired, false); err != nil || !ok || score != 10 {
+	if score, ok, err := counterPoint(previous, current, 1000, paired); err != nil || !ok || score != 10 {
 		t.Fatalf("got %v, %v, %v", score, ok, err)
 	}
-	if _, ok, err := counterPoint(previous, current, 2000, rateMetric, false); ok || err != nil {
+	if _, ok, err := counterPoint(previous, current, 2000, rateMetric); ok || err != nil {
 		t.Fatal("gap produced a point or error")
 	}
 
 	missing := current
 	missing.Pair = nil
-	if _, _, err := counterPoint(previous, missing, 1000, paired, false); err == nil {
+	if _, _, err := counterPoint(previous, missing, 1000, paired); err == nil {
 		t.Fatal("missing paired aggregation accepted")
 	}
 	fields := current.Pair.Hits.Rows[0].Fields
 	for _, ops := range [][]float64{nil, {7, 9}, {5}} {
 		fields["ops"] = ops
-		if _, ok, err := counterPoint(previous, current, 1000, paired, false); ok || err != nil {
+		if _, ok, err := counterPoint(previous, current, 1000, paired); ok || err != nil {
 			t.Fatal("missing, multivalued, or unchanged operations produced a latency point")
 		}
 	}
 	current.Value = &scalar{Value: new(float64)}
-	if _, ok, err := counterPoint(previous, current, 1000, rateMetric, false); ok || err != nil {
+	if _, ok, err := counterPoint(previous, current, 1000, rateMetric); ok || err != nil {
 		t.Fatal("counter reset produced a rate")
 	}
 	current.Value = previous.Value
-	if score, ok, err := counterPoint(previous, current, 1000, rateMetric, false); err != nil || !ok || score != 0 {
+	if score, ok, err := counterPoint(previous, current, 1000, rateMetric); err != nil || !ok || score != 0 {
 		t.Fatal("legal zero rate dropped")
 	}
 	current.Count++
-	if _, ok, err := counterPoint(previous, current, 1000, rateMetric, false); ok || err != nil {
+	if _, ok, err := counterPoint(previous, current, 1000, rateMetric); ok || err != nil {
 		t.Fatal("incomplete identity produced a rate")
-	}
-}
-
-func TestCounterPointApproximatesRollupLatency(t *testing.T) {
-	// A rollup page cannot carry the paired observation; the difference of the
-	// per-field maxima approximates the same monotonic transition.
-	rollup := func(key int64, elapsed, ops float64) samples {
-		return parseSample(t, fmt.Sprintf(`{"key":%d,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]},"first":{"value":%v},"second":{"value":%v}}`, key, elapsed, ops))
-	}
-	previous, current := rollup(1000, 100, 10), rollup(2000, 160, 12)
-	paired := Metric{mode: latency, Field: "elapsed", Field2: "ops"}
-	if score, ok, err := counterPoint(previous, current, 1000, paired, true); err != nil || !ok || score != 30 {
-		t.Fatalf("maxima fallback: %v, %v, %v", score, ok, err)
-	}
-	// Without the maxima the point is skipped, not rejected.
-	blank := rollup(2000, 0, 0)
-	blank.First, blank.Second = nil, nil
-	if _, ok, err := counterPoint(previous, blank, 1000, paired, true); ok || err != nil {
-		t.Fatalf("missing maxima: %v, %v", ok, err)
-	}
-	// A raw page keeps the strict pairing diagnostics.
-	if _, _, err := counterPoint(rollup(1000, 100, 10), rollup(2000, 160, 12), 1000, paired, false); err == nil {
-		t.Fatal("raw page accepted a missing paired aggregation")
-	}
-	// The monotonic guards still bound the approximation.
-	if _, ok, _ := counterPoint(rollup(1000, 200, 10), rollup(2000, 160, 12), 1000, paired, true); ok {
-		t.Fatal("decreasing elapsed produced a latency")
-	}
-	if _, ok, _ := counterPoint(rollup(1000, 100, 12), rollup(2000, 160, 12), 1000, paired, true); ok {
-		t.Fatal("unchanged operations produced a latency")
 	}
 }
 
@@ -98,7 +67,7 @@ func TestCounterPointRejectsTopologyChanges(t *testing.T) {
 	const topology = `,"shards":{"value":3},"replicas":{"value":1}`
 	previous := parseSample(t, `{"key":1000,`+same+topology+`}`)
 	stable := parseSample(t, `{"key":2000,`+same+topology+`}`)
-	if score, ok, err := counterPoint(previous, stable, 1000, Metric{mode: rate}, false); err != nil || !ok || score != 0 {
+	if score, ok, err := counterPoint(previous, stable, 1000, Metric{mode: rate}); err != nil || !ok || score != 0 {
 		t.Fatalf("unchanged topology must keep scoring: %v %v %v", score, ok, err)
 	}
 	for name, raw := range map[string]string{
@@ -106,18 +75,18 @@ func TestCounterPointRejectsTopologyChanges(t *testing.T) {
 		"replica change":      `{"key":2000,` + same + `,"shards":{"value":3},"replicas":{"value":2}}`,
 		"evidence disappears": `{"key":2000,` + same + `}`,
 	} {
-		if _, ok, err := counterPoint(previous, parseSample(t, raw), 1000, Metric{mode: rate}, false); ok || err != nil {
+		if _, ok, err := counterPoint(previous, parseSample(t, raw), 1000, Metric{mode: rate}); ok || err != nil {
 			t.Fatalf("%s produced a rate", name)
 		}
 	}
 	// Node samples never carry topology evidence; absence on both sides is not a change.
 	node := parseSample(t, `{"key":2000,`+same+`}`)
-	if score, ok, err := counterPoint(parseSample(t, `{"key":1000,`+same+`}`), node, 1000, Metric{mode: rate}, false); err != nil || !ok || score != 0 {
+	if score, ok, err := counterPoint(parseSample(t, `{"key":1000,`+same+`}`), node, 1000, Metric{mode: rate}); err != nil || !ok || score != 0 {
 		t.Fatalf("node transition without topology evidence: %v %v %v", score, ok, err)
 	}
 	// Evidence appearing on one side only is a change, whichever side it is.
 	for _, pair := range [][2]samples{{previous, node}, {node, previous}} {
-		if _, ok, err := counterPoint(pair[0], pair[1], 1000, Metric{mode: rate}, false); ok || err != nil {
+		if _, ok, err := counterPoint(pair[0], pair[1], 1000, Metric{mode: rate}); ok || err != nil {
 			t.Fatal("one-sided topology evidence produced a rate")
 		}
 	}

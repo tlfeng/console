@@ -8,7 +8,7 @@ import (
 )
 
 func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Query, metric Metric) error {
-	budget := searchBucketLimit - 2 // Reserve the scan and history filter buckets.
+	budget := searchBucketLimit - 2 // Keep the existing single-search headroom.
 	const maxCandidates = 192
 	capacity := budget / (metricBucketCost(q, metric) + 1)
 	selectedOnly := q.selected != nil
@@ -29,11 +29,13 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	entityTerms["order"] = dsl{"_key": "asc"}
 	// The first maxEntities keys are visible across shards, so a full automatic
 	// response cannot prove that every candidate was ranked.
-	aggs := dsl{"scan": dsl{"filter": metricScope(q, metric), "aggs": dsl{"entities": dsl{
-		"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))},
-	}}}}
+	pred["filter"] = append(pred["filter"].([]dsl), metricScope(q, metric))
+	aggs := dsl{"entities": dsl{"terms": entityTerms, "aggs": dsl{"dates": q.histogram(metricAggs(q, metric))}}}
 	// The target is a concrete index or alias. ES 6.8 does not support hidden wildcard expansion.
 	path := "/" + index + "/_search?allow_partial_search_results=false&allow_no_indices=false&ignore_unavailable=false"
+	if q.easysearch {
+		path += "&enable_rollup=false"
+	}
 	request := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": aggs}
 	if err := searchTimeout(ctx, request); err != nil {
 		return err
@@ -46,30 +48,24 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return err
 	}
-	if response.TimedOut != nil && *response.TimedOut {
-		return context.DeadlineExceeded
-	}
-	// A rollup-backed response is an accepted approximation: the rewritten
-	// search's shard layout need not match the original index. Latency pairs it
-	// cannot provide are skipped by the approximate scoring below.
-	rollup := response.Origin != ""
-	if !rollup && !response.complete() {
-		return errors.New("incomplete monitoring search")
-	}
-	var scan struct {
-		Entities struct {
-			Buckets []struct {
-				Key   string `json:"key"`
-				Dates struct {
-					Buckets []samples `json:"buckets"`
-				} `json:"dates"`
-			} `json:"buckets"`
-		} `json:"entities"`
-	}
-	if err := json.Unmarshal(response.Aggs["scan"], &scan); err != nil {
+	if err := response.validate(); err != nil {
 		return err
 	}
-	entities := scan.Entities.Buckets
+	if response.Origin != "" {
+		return errors.New("unexpected monitoring search source")
+	}
+	var scan struct {
+		Buckets []struct {
+			Key   string `json:"key"`
+			Dates struct {
+				Buckets []samples `json:"buckets"`
+			} `json:"dates"`
+		} `json:"buckets"`
+	}
+	if err := json.Unmarshal(response.Aggs["entities"], &scan); err != nil {
+		return err
+	}
+	entities := scan.Buckets
 	if entities == nil {
 		return errors.New("missing TopN entities")
 	}
@@ -95,7 +91,7 @@ func singleSearch(ctx context.Context, call caller, index string, pred dsl, q Qu
 		if truncated {
 			continue
 		}
-		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets, rollup)
+		candidate, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
 		if err != nil {
 			return err
 		}

@@ -17,7 +17,7 @@ func TestBackendTimeoutKeepsRotatedPIT(t *testing.T) {
 		return []byte(`{"pit_id":"after",` + allShards + `,"timed_out":true}`), nil
 	}}
 	var out interface{}
-	_, err := s.search(ctx, dsl{}, dsl{}, &out)
+	err := s.search(ctx, dsl{}, dsl{}, &out)
 	if failureStatus(err) != "budget_exceeded" || s.id != "after" || out != nil {
 		t.Fatalf("err=%v id=%s out=%v", err, s.id, out)
 	}

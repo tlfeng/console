@@ -33,7 +33,7 @@ func TestScoreSeries(t *testing.T) {
 	mk := func(ts int64, value float64) samples {
 		return samples{Time: &ts, Value: &scalar{Value: &value}}
 	}
-	row, err := scoreSeries(q, Metric{}, "entity", []samples{mk(1000, 0), mk(3000, 4)}, false)
+	row, err := scoreSeries(q, Metric{}, "entity", []samples{mk(1000, 0), mk(3000, 4)})
 	want := [][]interface{}{{int64(1000), 0.0}, {int64(2000), nil}, {int64(3000), 4.0}}
 	if err != nil || row.score != 4 || !reflect.DeepEqual(row.points, want) {
 		t.Fatalf("row=%+v err=%v", row, err)
@@ -44,7 +44,7 @@ func TestScoreSeries(t *testing.T) {
 		parseSample(t, `{"key":1000,"value":{"value":30}`+identity),
 		parseSample(t, `{"key":2000,"value":{"value":40}`+identity),
 	}
-	row, err = scoreSeries(q, Metric{mode: rate}, "index", points, false)
+	row, err = scoreSeries(q, Metric{mode: rate}, "index", points)
 	if err != nil || row.score != 10 || !reflect.DeepEqual(row.points, [][]interface{}{{int64(2000), 10.0}}) {
 		t.Fatalf("row=%+v err=%v", row, err)
 	}
@@ -67,34 +67,13 @@ func TestRatioAggregation(t *testing.T) {
 		{"measured zero", `{"key":1000,"doc_count":360,"value":{"value":0}}`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			row, err := scoreSeries(q, metric, "node", []samples{parseSample(t, tc.raw)}, false)
+			row, err := scoreSeries(q, metric, "node", []samples{parseSample(t, tc.raw)})
 			if err != nil || row.score != tc.score || (len(row.points) != 0) != (tc.score >= 0) {
 				t.Fatalf("row=%+v err=%v", row, err)
 			}
 		})
 	}
-	if _, err := scoreSeries(q, metric, "node", []samples{parseSample(t, `{"key":1000,"doc_count":360}`)}, false); err == nil {
+	if _, err := scoreSeries(q, metric, "node", []samples{parseSample(t, `{"key":1000,"doc_count":360}`)}); err == nil {
 		t.Fatal("missing ratio result accepted")
-	}
-}
-
-func TestScoreSeriesApproximatesRollupLatency(t *testing.T) {
-	q := Query{Source: "index_stats", Min: 1001, Max: 3999, Width: 1, N: 1}
-	metric := Metric{mode: latency, Field: "elapsed", Field2: "ops"}
-	const identity = `,"doc_count":1,"identity":{"buckets":[{"key":"id","doc_count":1}]}`
-	points := []samples{
-		parseSample(t, `{"key":1000,"first":{"value":100},"second":{"value":10}`+identity+`}`),
-		parseSample(t, `{"key":2000,"first":{"value":160},"second":{"value":12}`+identity+`}`),
-		parseSample(t, `{"key":3000,"first":{"value":180},"second":{"value":13}`+identity+`}`),
-	}
-	// The first visible point needs the pre-read predecessor; from then on the
-	// maxima differences render 30 and 20 ms per operation.
-	row, err := scoreSeries(q, metric, "index", points, true)
-	want := [][]interface{}{{int64(2000), 30.0}, {int64(3000), 20.0}}
-	if err != nil || row.score != 30 || !reflect.DeepEqual(row.points, want) {
-		t.Fatalf("row=%+v err=%v", row, err)
-	}
-	if _, err := scoreSeries(q, metric, "index", points, false); err == nil {
-		t.Fatal("raw page must still reject a missing paired observation")
 	}
 }

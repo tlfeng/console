@@ -22,6 +22,25 @@ import { CopyToClipboard } from "react-copy-to-clipboard";
 import moment from "moment";
 import { ESPrefix } from "@/services/common";
 
+const TOPN_RETRY_DELAYS = [1000, 2000, 4000, 8000];
+
+const waitForTopNRetry = (delay, signal) => new Promise(resolve => {
+  const finish = () => {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', finish);
+    resolve();
+  };
+  const timer = setTimeout(finish, delay);
+  signal.addEventListener('abort', finish, { once: true });
+});
+
+const dispatchVisibleQuery = (state) => {
+  const { startQuery } = state;
+  if (!state.isInView || !startQuery || startQuery === state.lastQuery) return;
+  state.lastQuery = startQuery;
+  startQuery();
+};
+
 export default (props) => {
 
     const { 
@@ -69,39 +88,48 @@ export default (props) => {
     const querySignature = JSON.stringify(queryParams)
 
     const abortTopN = () => {
-      const active = activeTopNRef.current;
+      const controller = activeTopNRef.current;
       activeTopNRef.current = undefined;
-      active?.controller.abort();
+      controller?.abort();
     }
 
     const fetchData = async (params, showLoading) => {
       if (!observerRef.current.isInView || !fetchUrl) return;
-      const newQueryParams = { ...params, key: metricKey, timeout };
+      const newQueryParams = { ...cloneDeep(params), key: metricKey, timeout };
       if (timeInterval) newQueryParams.bucket_size = timeInterval;
 
       if (advancedTopN) {
-        // The server waits for on-demand work and answers once with a final
-        // status, so one request is one outcome; a newer query aborts this one.
-        activeTopNRef.current?.controller.abort();
+        abortTopN();
         const controller = new AbortController();
-        activeTopNRef.current = { key: chartQuery, controller };
+        activeTopNRef.current = controller;
+        const { signal } = controller;
+        // Resolve a relative window once: moving bounds would start a different
+        // background job instead of joining or reading the original one.
+        if (timeRange?.min != null && timeRange?.max != null) {
+          Object.assign(newQueryParams, formatTimeRange(timeRange));
+        }
         newQueryParams.advanced_topn = true;
         setError();
         if (firstFetchRef.current || showLoading) setLoading(true);
 
         let res;
-        try {
-          res = await request(fetchUrl, {
-            method: 'GET',
-            queryParams: newQueryParams,
-            ignoreTimeout: true,
-            signal: controller.signal,
-            expirys: false
-          }, false, false);
-        } catch {
-          res = undefined;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            res = await request(fetchUrl, {
+              method: 'GET',
+              queryParams: newQueryParams,
+              ignoreTimeout: true,
+              signal,
+              expirys: false
+            }, false, false);
+          } catch {
+            res = undefined;
+          }
+          if (signal.aborted) return;
+          if (res?.topn_status !== 'busy' || attempt >= TOPN_RETRY_DELAYS.length) break;
+          await waitForTopNRetry(TOPN_RETRY_DELAYS[attempt], signal);
+          if (signal.aborted) return;
         }
-        if (activeTopNRef.current?.controller !== controller || !observerRef.current.isInView) return;
         activeTopNRef.current = undefined;
         firstFetchRef.current = false;
         const fail = (status) => {
@@ -152,11 +180,6 @@ export default (props) => {
     }
 
     useLayoutEffect(() => {
-      observerRef.current.query = chartQuery;
-      observerRef.current.advancedTopN = advancedTopN;
-    }, [chartQuery, advancedTopN]);
-
-    useLayoutEffect(() => {
       const observer = observerRef.current;
       observer.legacyContext = {};
       setMetric(undefined);
@@ -166,29 +189,29 @@ export default (props) => {
       return () => { observer.legacyContext = undefined; };
     }, [advancedTopN]);
 
-    // Invalidate before I/O can report a result for an older committed query.
     useLayoutEffect(() => {
       if (advancedTopN) setMetric(undefined);
-      return abortTopN;
     }, [chartQuery]);
+
+    // Publish the current dispatch and invalidate old TopN work at commit,
+    // before either the passive effect or the observer can start the query.
+    useLayoutEffect(() => {
+      const state = observerRef.current;
+      state.advancedTopN = advancedTopN;
+      state.startQuery = () => fetchData(queryParams, refresh);
+      return () => {
+        state.startQuery = undefined;
+        state.lastQuery = undefined;
+        if (advancedTopN) abortTopN();
+      };
+    }, [querySignature, chartQuery, refresh]);
 
     const fixFormat = (formatType, format) => {
       return formatType === 'num' && format ? `${format}a` : format
     }
 
-    const currentParams = (params) => advancedTopN && timeRange?.min != null && timeRange?.max != null
-      ? { ...params, ...formatTimeRange(timeRange) }
-      : params;
-
     useEffect(() => {
-      const observer = observerRef.current;
-      const args = [cloneDeep(queryParams), refresh];
-      const deps = { key: chartQuery, start: () => fetchData(currentParams(args[0]), args[1]) };
-      observer.deps = deps;
-      if (observer.isInView) {
-        observer.lastDeps = deps;
-        fetchData(...args);
-      }
+      dispatchVisibleQuery(observerRef.current);
     }, [querySignature, chartQuery, refresh]);
 
     useEffect(() => {
@@ -198,16 +221,12 @@ export default (props) => {
           entries.forEach(entry => {
             if (entry.isIntersecting) {
               state.isInView = true;
-              const { deps } = state;
-              if (deps && deps.key === state.query && deps !== state.lastDeps) {
-                state.lastDeps = deps;
-                deps.start();
-              }
+              dispatchVisibleQuery(state);
             } else {
               state.isInView = false;
               if (state.advancedTopN) {
                 abortTopN();
-                state.lastDeps = undefined;
+                state.lastQuery = undefined;
                 setLoading(false);
               }
             }
@@ -219,10 +238,13 @@ export default (props) => {
         }
       );
       if (containerRef.current) observer.observe(containerRef.current);
-      return () => observer.disconnect();
+      return () => {
+        observer.disconnect();
+        state.isInView = false;
+      };
     }, []);
 
-    const handleRefresh = () => fetchData(cloneDeep(currentParams(queryParams)), true);
+    const handleRefresh = () => fetchData(queryParams, true);
   
     const handleChartBrush = ({ x }) => {
       if (!x) {

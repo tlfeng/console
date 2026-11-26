@@ -2,6 +2,7 @@ package topn
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -51,7 +52,7 @@ func TestPITDialects(t *testing.T) {
 				t.Fatal(err)
 			}
 			var value struct{}
-			if _, err := s.search(context.Background(), dsl{}, dsl{}, &value); err != nil {
+			if err := s.search(context.Background(), dsl{}, dsl{}, &value); err != nil {
 				t.Fatal(err)
 			}
 			s.close()
@@ -72,13 +73,15 @@ func TestQueryRouting(t *testing.T) {
 	for _, tc := range []struct {
 		name, source        string
 		usePIT, partialOpen bool
+		oversized           bool
 		want                []string
 	}{
-		{"node PIT", "node_stats", true, false, []string{"open", "search", "close"}},
-		{"node incomplete PIT", "node_stats", true, true, []string{"open", "close", "single"}},
-		{"index PIT", "index_stats", true, false, []string{"open", "search", "close"}},
-		{"index incomplete PIT", "index_stats", true, true, []string{"open", "close", "single"}},
-		{"index without PIT", "index_stats", false, false, []string{"single"}},
+		{"node PIT", "node_stats", true, false, false, []string{"open", "search", "close"}},
+		{"node incomplete PIT", "node_stats", true, true, false, []string{"open", "close", "single"}},
+		{"index PIT", "index_stats", true, false, false, []string{"open", "search", "close"}},
+		{"index incomplete PIT", "index_stats", true, true, false, []string{"open", "close", "single"}},
+		{"index without PIT", "index_stats", false, false, false, []string{"single"}},
+		{"oversized PIT", "index_stats", true, false, true, []string{"open", "close"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := Query{Source: tc.source, Min: 1000, Max: 1999, Width: 1, N: 5, AllIndices: true}
@@ -89,6 +92,9 @@ func TestQueryRouting(t *testing.T) {
 				switch {
 				case strings.HasPrefix(path, "/raw/_pit?"):
 					calls = append(calls, "open")
+					if tc.oversized {
+						return []byte(`{"id":"oversized","_shards":{"total":33,"successful":33,"failed":0}}`), nil
+					}
 					if tc.partialOpen {
 						return []byte(`{"id":"partial","_shards":{"total":3,"successful":2,"failed":0}}`), nil
 					}
@@ -101,7 +107,7 @@ func TestQueryRouting(t *testing.T) {
 					return result(`{"buckets":[]}`), nil
 				case strings.HasPrefix(path, "/raw/_search?"):
 					calls = append(calls, "single")
-					return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
+					return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"entities":{"buckets":[]}}}`), nil
 				}
 				t.Fatalf("unexpected request %s %s", method, path)
 				return nil, nil
@@ -110,8 +116,9 @@ func TestQueryRouting(t *testing.T) {
 			if tc.usePIT {
 				selected = api
 			}
-			if err := runQuery(context.Background(), call, selected, "raw", pred, q, metric); err != nil {
-				t.Fatal(err)
+			err := runQuery(context.Background(), call, selected, "raw", pred, q, metric)
+			if (tc.oversized && !errors.Is(err, errBudget)) || (!tc.oversized && err != nil) {
+				t.Fatalf("unexpected routing error: %v", err)
 			}
 			if !reflect.DeepEqual(calls, tc.want) {
 				t.Fatalf("calls=%v want %v", calls, tc.want)

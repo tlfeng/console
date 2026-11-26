@@ -91,6 +91,7 @@ type Query struct {
 	Indices         []string
 	selected        []string
 	legacyInterval  bool
+	easysearch      bool
 	// pageBudget overrides the interactive composite page cap for background
 	// scans; zero keeps the interactive budget.
 	pageBudget int
@@ -160,6 +161,7 @@ func (q Query) histogram(aggs dsl) dsl {
 }
 
 func (q *Query) setSearchVersion(version elastic.Version) {
+	q.easysearch = version.Distribution == elastic.Easysearch
 	if version.Distribution != elastic.Elasticsearch && version.Distribution != "" {
 		return
 	}
@@ -270,11 +272,10 @@ func pitFor(version elastic.Version) pitAPI {
 }
 
 type snapshot struct {
-	rawIndexUUIDs map[string]string
-	call          caller
-	api           pitAPI
-	id            string
-	shards        int
+	call   caller
+	api    pitAPI
+	id     string
+	shards int
 }
 
 func open(ctx context.Context, call caller, index string, api pitAPI) (*snapshot, error) {
@@ -369,42 +370,42 @@ type searchResponse struct {
 	Aggs       map[string]json.RawMessage `json:"aggregations"`
 }
 
-func (r searchResponse) complete() bool {
-	return r.Shards.complete() && r.TimedOut != nil && !*r.TimedOut && !r.Terminated
+func (r searchResponse) validate() error {
+	if r.TimedOut != nil && *r.TimedOut {
+		return context.DeadlineExceeded
+	}
+	if r.TimedOut == nil || r.Terminated || !r.Shards.complete() {
+		return errors.New("incomplete monitoring search")
+	}
+	return nil
 }
 
-// search runs one aggregate read on the snapshot and reports whether the
-// store served it from rollup data. A rollup-backed page is a lower-precision
-// approximation: the rewritten search runs on different indices, so its shard
-// layout need not match the snapshot's raw layout, and it cannot carry the
-// paired latency observation.
-func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) (bool, error) {
+type aggregateSearch func(context.Context, dsl, dsl, interface{}) error
+
+func (s *snapshot) search(ctx context.Context, pred dsl, agg dsl, result interface{}) error {
 	body := dsl{"size": 0, "track_total_hits": false, "query": dsl{"bool": pred}, "aggs": dsl{"entities": agg}, "pit": dsl{"id": s.id, "keep_alive": "30s"}}
 	if err := searchTimeout(ctx, body); err != nil {
-		return false, err
+		return err
 	}
 	raw, err := s.call(ctx, http.MethodPost, "/_search?allow_partial_search_results=false", body)
-	if err != nil && len(raw) == 0 {
-		return false, err
-	}
 	var response searchResponse
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return false, err
-	}
+	decodeErr := json.Unmarshal(raw, &response)
 	if response.ID != "" {
 		s.id = response.ID
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
-	if response.TimedOut != nil && *response.TimedOut {
-		return false, context.DeadlineExceeded
+	if decodeErr != nil {
+		return decodeErr
 	}
-	rollup := response.Origin != ""
-	if !rollup && (!response.complete() || response.Shards.Total != s.shards) {
-		return false, errors.New("incomplete monitoring search")
+	if err := response.validate(); err != nil {
+		return err
 	}
-	return rollup, json.Unmarshal(response.Aggs["entities"], result)
+	if response.Origin != "" || response.Shards.Total != s.shards {
+		return errors.New("unexpected monitoring snapshot source")
+	}
+	return json.Unmarshal(response.Aggs["entities"], result)
 }
 
 func terms(field string, n int) dsl { return dsl{"field": field, "size": n, "shard_size": n} }
@@ -418,12 +419,16 @@ func display(q Query, metric Metric, name string, data [][]interface{}) {
 func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) error {
 	filters := pred["filter"].([]dsl)
 	pred["filter"] = append(filters, filterRange(q.Min, q.Max), dsl{"range": dsl{metric.Field: dsl{"gte": 0}}})
+	return peakSeries(ctx, s.search, q, pred, metric)
+}
+
+func peakSeries(ctx context.Context, search aggregateSearch, q Query, pred dsl, metric Metric) error {
 	t := terms(q.entity(), q.N)
 	t["order"] = []dsl{{"peak": "desc"}, {"_key": "asc"}}
 	var rank struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if _, err := s.search(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
+	if err := search(ctx, pred, dsl{"terms": t, "aggs": dsl{"peak": maximum(metric.Field)}}, &rank); err != nil {
 		return err
 	}
 	if rank.Buckets == nil || len(rank.Buckets) > q.N {
@@ -436,10 +441,10 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	scores := make(map[string]float64, len(rank.Buckets))
 	allowed := q.authorizer()
 	for _, b := range rank.Buckets {
-		if !allowed(b.Key) {
+		if !allowed(b.Key) || (q.Source == "index_stats" && b.Key == "_all") {
 			return errors.New("unexpected entity in TopN authorization filter")
 		}
-		if _, exists := scores[b.Key]; exists || b.Key == "" || b.Peak == nil || b.Peak.Value == nil {
+		if _, exists := scores[b.Key]; exists || b.Key == "" || b.Peak == nil || b.Peak.Value == nil || !validCounter(*b.Peak.Value) {
 			return errors.New("invalid TopN ranking")
 		}
 		names = append(names, b.Key)
@@ -449,7 +454,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 	var curves struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	rollup, err := s.search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves)
+	err := search(ctx, pred, dsl{"terms": terms(q.entity(), len(names)), "aggs": dsl{"dates": q.histogram(dsl{"value": maximum(metric.Field)})}}, &curves)
 	if err != nil {
 		return err
 	}
@@ -462,7 +467,7 @@ func peaks(ctx context.Context, s *snapshot, q Query, pred dsl, metric Metric) e
 		if !ok || data[b.Key] != nil || b.Dates == nil || len(b.Dates.Buckets) == 0 {
 			return errors.New("invalid TopN curve")
 		}
-		row, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets, rollup)
+		row, err := scoreSeries(q, metric, b.Key, b.Dates.Buckets)
 		if err != nil {
 			return err
 		}
@@ -483,6 +488,11 @@ var slots = make(chan struct{}, 4)
 // background registry: beyond it, scanning is the only way to produce the
 // chart, so the interactive deadline no longer applies.
 const longWindow = 24 * time.Hour
+
+func (q Query) longAutomaticWindow() bool {
+	// The query includes both endpoint milliseconds.
+	return q.selected == nil && q.Max-q.Min >= longWindow.Milliseconds()-1
+}
 
 var errUnavailable = errors.New("automatic TopN unavailable")
 
@@ -553,7 +563,12 @@ func calculateWithConfig(ctx context.Context, q Query, metric Metric, cfg config
 	if q.selected != nil {
 		return withSlot(func() error { return runSelected(ctx, call, index, pred, q, metric) })
 	}
-	return withSlot(func() error { return runQuery(ctx, call, pitFor(version), index, pred, q, metric) })
+	return withSlot(func() error {
+		if tryRollupPeak(ctx, call, index, q, metric) {
+			return nil
+		}
+		return runQuery(ctx, call, pitFor(version), index, pred, q, metric)
+	})
 }
 
 func withSlot(work func() error) error {
@@ -574,7 +589,7 @@ func runQuery(ctx context.Context, call caller, api pitAPI, index string, pred d
 	// search is the fallback when the store cannot open one.
 	s, err := open(ctx, call, index, api)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, errBudget) {
 			return err
 		}
 		return singleSearch(ctx, call, index, pred, q, metric)

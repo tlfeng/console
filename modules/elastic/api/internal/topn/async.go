@@ -3,6 +3,7 @@ package topn
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -37,16 +38,21 @@ var (
 	asyncErrorTTL  = 5 * time.Second
 )
 
+// Background scans also use the shared query slots. Limit new background
+// jobs separately so they cannot occupy more than two of the four shared slots.
+var asyncSlots = make(chan struct{}, 2)
+
 type chartKey [sha256.Size]byte
 
 // chartEntry is one shared in-memory chart computation. The job goroutine
 // writes the fields before closing done; readers only touch them afterwards,
 // so the close publishes every write.
 type chartEntry struct {
-	done    chan struct{}
-	err     error
-	metric  Metric
-	expires time.Time
+	done           chan struct{}
+	holdsAsyncSlot bool
+	err            error
+	metric         Metric
+	expires        time.Time
 }
 
 func (e *chartEntry) finished() bool {
@@ -70,8 +76,8 @@ type chartRegistry struct {
 var charts chartRegistry
 
 // acquire returns the entry for key, spawning the computation when none is
-// running. A finished entry past its TTL is recomputed; when the registry is
-// full and nothing is evictable, ok is false and the caller reports busy.
+// running and no retained result exists. Only new jobs take a background slot;
+// if either the registry or the background slots are full, ok is false.
 func (reg *chartRegistry) acquire(key chartKey, spawn func(*chartEntry)) (*chartEntry, bool) {
 	reg.Lock()
 	defer reg.Unlock()
@@ -92,7 +98,12 @@ func (reg *chartRegistry) acquire(key chartKey, spawn func(*chartEntry)) (*chart
 	if len(reg.jobs) >= chartJobLimit {
 		return nil, false
 	}
-	e := &chartEntry{done: make(chan struct{})}
+	select {
+	case asyncSlots <- struct{}{}:
+	default:
+		return nil, false
+	}
+	e := &chartEntry{done: make(chan struct{}), holdsAsyncSlot: true}
 	reg.jobs[key] = e
 	// The job must never run under the registry lock: a slow computation
 	// would otherwise block every other acquire, including its own waiter.
@@ -135,7 +146,7 @@ func Serve(w http.ResponseWriter, r *http.Request, q Query, metric Metric) {
 	waitCtx, cancelWait := context.WithTimeout(r.Context(), queryWaitTimeout(r.URL.Query().Get("timeout")))
 	defer cancelWait()
 	w.Header().Set("Cache-Control", "no-store")
-	if q.selected == nil && time.Duration(q.Max-q.Min)*time.Millisecond >= longWindow {
+	if q.longAutomaticWindow() {
 		serveLongWindow(w, q, metric, waitCtx)
 		return
 	}
@@ -210,6 +221,10 @@ func serveLongWindowWithConfig(w http.ResponseWriter, q Query, metric Metric, wa
 // single search is larger than an interactive attempt.
 func runChartJob(entry *chartEntry, q Query, metric Metric, cfg config, index string, store func() (caller, elastic.Version)) {
 	defer close(entry.done)
+	if entry.holdsAsyncSlot {
+		// Return the slot before waking waiters so an immediate retry can enter.
+		defer func() { <-asyncSlots }()
+	}
 	scan := q
 	scan.pageBudget = asyncMaxPages
 	jobCtx, cancel := context.WithTimeout(context.Background(), asyncJobTimeout)
@@ -217,6 +232,10 @@ func runChartJob(entry *chartEntry, q Query, metric Metric, cfg config, index st
 	err := calculateWithConfig(jobCtx, scan, metric, cfg, store)
 	entry.metric = metric
 	entry.err = err
+	if errors.Is(err, errBusy) {
+		// Publish busy to current waiters, but let the next acquire retry.
+		return
+	}
 	if err != nil {
 		entry.expires = time.Now().Add(asyncErrorTTL)
 		return

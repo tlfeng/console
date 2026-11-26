@@ -84,7 +84,7 @@ func number(s *scalar) (float64, bool) {
 	return *s.Value, true
 }
 
-func scoreSeries(q Query, metric Metric, name string, points []samples, approx bool) (winner, error) {
+func scoreSeries(q Query, metric Metric, name string, points []samples) (winner, error) {
 	width := int64(q.Width) * 1000
 	first := q.Min / width * width
 	earliest := first
@@ -116,7 +116,7 @@ func scoreSeries(q Query, metric Metric, name string, points []samples, approx b
 			}
 		default:
 			var err error
-			v, valid, err = counterPoint(previous, p, width, metric, approx)
+			v, valid, err = counterPoint(previous, p, width, metric)
 			if err != nil {
 				return winner{}, err
 			}

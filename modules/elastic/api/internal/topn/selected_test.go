@@ -52,11 +52,11 @@ func TestSelectedSearchUsesFullBucketCapacity(t *testing.T) {
 	calls := 0
 	call := func(_ context.Context, _, _ string, body dsl) ([]byte, error) {
 		calls++
-		entities := body["aggs"].(dsl)["scan"].(dsl)["aggs"].(dsl)["entities"].(dsl)
+		entities := body["aggs"].(dsl)["entities"].(dsl)
 		if got := entities["terms"].(dsl)["size"]; got != 3 {
 			t.Fatalf("selected query requested %v terms, want 3", got)
 		}
-		return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
+		return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"entities":{"buckets":[]}}}`), nil
 	}
 	if err := singleSearch(context.Background(), call, "raw", pred, q, m); err != nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)

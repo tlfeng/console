@@ -97,30 +97,8 @@ func TestIncompleteSnapshotSearch(t *testing.T) {
 	var rows struct {
 		Buckets []bucket `json:"buckets"`
 	}
-	if _, err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil || s.id != "rotated" {
+	if err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil || s.id != "rotated" {
 		t.Fatalf("err=%v pit=%s", err, s.id)
-	}
-}
-
-func TestRollupBackedSnapshotSearch(t *testing.T) {
-	// A rollup rewrite serves the search from different indices: the response
-	// carries a foreign origin and a different shard layout, but still ranks.
-	s := snapshot{id: "fixed", shards: 3, call: func(context.Context, string, string, dsl) ([]byte, error) {
-		return []byte(`{"origin":"rollup","pit_id":"rotated","_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"entities":{"buckets":[{"key":"entity","peak":{"value":5}}]}}}`), nil
-	}}
-	var rows struct {
-		Buckets []bucket `json:"buckets"`
-	}
-	rollup, err := s.search(context.Background(), dsl{}, dsl{}, &rows)
-	if err != nil || !rollup || s.id != "rotated" || len(rows.Buckets) != 1 {
-		t.Fatalf("rollup=%v err=%v pit=%s rows=%v", rollup, err, s.id, rows.Buckets)
-	}
-	// A raw page must still match the snapshot's own shard layout.
-	s = snapshot{id: "fixed", shards: 3, call: func(context.Context, string, string, dsl) ([]byte, error) {
-		return []byte(`{"_shards":{"total":1,"successful":1,"failed":0},"timed_out":false,"aggregations":{"entities":{"buckets":[]}}}`), nil
-	}}
-	if _, err := s.search(context.Background(), dsl{}, dsl{}, &rows); err == nil {
-		t.Fatal("raw page with a foreign shard layout was accepted")
 	}
 }
 
@@ -229,7 +207,7 @@ func TestLongWindowUsesRawIndex(t *testing.T) {
 			if method != http.MethodPost || !strings.HasPrefix(path, "/raw/_search?") {
 				t.Fatalf("unexpected backend request: %s %s", method, path)
 			}
-			return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"scan":{"entities":{"buckets":[]}}}}`), nil
+			return []byte(`{` + allShards + `,"timed_out":false,"aggregations":{"entities":{"buckets":[]}}}`), nil
 		}, elastic.Version{}
 	}
 	metric := indexingRateMetric(t)
